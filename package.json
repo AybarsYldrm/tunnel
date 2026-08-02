@@ -1,0 +1,88 @@
+{
+  "name": "node-dtls",
+  "version": "1.0.0",
+  "description": "Sıfır bağımlılıklı, saf Node.js DTLS 1.3 (RFC 9147) ve DTLS 1.2 (RFC 6347) yığını — mTLS, sertifika zinciri doğrulama, OCSP/CRL iptal denetimi, SNI, DTLS-SRTP (WebRTC) ve QUIC (RFC 9002) kayıp kurtarmalı veri kanalı desteğiyle.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": "./index.js",
+    "./constants": "./src/constants.js",
+    "./package.json": "./package.json",
+    "./tunnel": "./tunnel/index.js",
+    "./tunnel/client": "./tunnel/src/client/index.js",
+    "./tunnel/server": "./tunnel/src/server/index.js"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "src/",
+    "tunnel/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node tests/run-all.js",
+    "test:kat": "node tests/test-kat.js",
+    "test:unit": "node tests/test-unit.js",
+    "test:e2e": "node tests/test-e2e.js",
+    "test:mtls": "node tests/test-mtls.js",
+    "test:srtp": "node tests/test-srtp.js",
+    "test:reliable": "node tests/test-reliable.js",
+    "test:robust": "node tests/test-robustness.js",
+    "test:retransmit": "node tests/test-retransmit.js",
+    "certs": "bash scripts/gen-certs.sh",
+    "example:server": "node examples/echo-server.js",
+    "example:client": "node examples/echo-client.js",
+    "test:revocation": "node tests/test-revocation.js",
+    "certs:force": "bash scripts/gen-certs.sh --force",
+    "example:revocation": "node examples/mtls-revocation.js",
+    "test:tunnel": "node tunnel/test/test-tunnel.js",
+    "test:tunnel-protocol": "node tunnel/test/test-protocol.js",
+    "test:tunnel-admin": "node tunnel/test/test-admin.js",
+    "tunnel:server": "node tunnel/bin/fitfak-tunneld.js",
+    "tunnel:client": "node tunnel/bin/fitfak-tunnel.js"
+  },
+  "keywords": [
+    "dtls",
+    "dtls1.3",
+    "dtls1.2",
+    "rfc9147",
+    "rfc6347",
+    "srtp",
+    "dtls-srtp",
+    "webrtc",
+    "mtls",
+    "mutual-tls",
+    "udp",
+    "datagram",
+    "tls",
+    "sni",
+    "zero-dependency",
+    "ocsp",
+    "crl",
+    "revocation",
+    "x509",
+    "pki",
+    "rfc9002",
+    "rfc6960",
+    "ocsp-stapling",
+    "tunnel",
+    "reverse-proxy",
+    "ingress",
+    "nat-traversal",
+    "oauth2",
+    "device-code"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AybarsYldrm/dtls.git"
+  },
+  "bin": {
+    "fitfak-tunnel": "./tunnel/bin/fitfak-tunnel.js",
+    "fitfak-tunneld": "./tunnel/bin/fitfak-tunneld.js"
+  }
+}

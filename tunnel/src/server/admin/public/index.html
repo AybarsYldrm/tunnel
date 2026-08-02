@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>fitfak tünel — yönetim</title>
+<!-- Stil ve betik ayrı dosyalarda: içerik güvenliği politikası satır içi
+     script/style'a izin vermiyor. Bu, panelde bir XSS bulunsa bile onun
+     çalıştırılabilir bir yük taşımasını engelleyen tek gerçek engel. -->
+<link rel="stylesheet" href="/tunnel-ui.css">
+</head>
+<body>
+
+<aside>
+  <div class="brand">fitfak <span>tünel</span></div>
+  <div class="brand-sub" id="listener">—</div>
+
+  <div class="nav-group">
+    <div class="nav-label">Genel</div>
+    <button class="nav-item active" data-view="overview"><span>Genel bakış</span></button>
+  </div>
+  <div class="nav-group">
+    <div class="nav-label">Bağlantılar</div>
+    <button class="nav-item" data-view="tunnels"><span>Tüneller</span><span class="nav-count" id="count-tunnels">0</span></button>
+    <button class="nav-item" data-view="clients"><span>İstemciler</span><span class="nav-count" id="count-clients">0</span></button>
+  </div>
+  <div class="nav-group">
+    <div class="nav-label">Yayın</div>
+    <button class="nav-item" data-view="apps"><span>Uygulamalar</span><span class="nav-count" id="count-apps">0</span></button>
+    <button class="nav-item" data-view="ports"><span>Port havuzu</span></button>
+  </div>
+  <div class="nav-group">
+    <div class="nav-label">Güvenlik</div>
+    <button class="nav-item" data-view="guard"><span>Koruma</span><span class="nav-count" id="count-bans">0</span></button>
+    <button class="nav-item" data-view="events"><span>Denetim kaydı</span></button>
+  </div>
+
+  <div class="sidebar-foot">
+    <div><span class="live-dot" id="live"></span><span id="live-text">bağlanıyor…</span></div>
+    <div id="whoami" style="margin-top:8px">—</div>
+    <button class="btn btn-sm" id="btn-logout" style="margin-top:10px">Çıkış</button>
+  </div>
+</aside>
+
+<main>
+  <div class="banner banner-err" id="err"></div>
+  <div class="banner banner-ok" id="ok"></div>
+
+  <!-- ================= GENEL BAKIŞ ================= -->
+  <section class="view active" id="view-overview">
+    <div class="page-head">
+      <div><h1>Genel bakış</h1><p class="page-sub">DTLS tünel ağının canlı durumu.</p></div>
+      <button class="btn" id="btn-refresh">Yenile</button>
+    </div>
+    <div class="stats" id="overview-stats"></div>
+    <div class="table-wrap">
+      <div class="table-head"><h2>Canlı tüneller</h2></div>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>İstemci</th><th>Adres</th><th>RTT</th><th>Bant genişliği</th><th>Toplam</th><th>Uygulama</th><th>Durum</th></tr></thead>
+          <tbody id="overview-tunnels"><tr><td colspan="7" class="empty">yükleniyor…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= TÜNELLER ================= -->
+  <section class="view" id="view-tunnels">
+    <div class="page-head">
+      <div><h1>Tüneller</h1><p class="page-sub">Bağlı istemciler, sertifika durumları ve bağlantı kalitesi.</p></div>
+    </div>
+    <div id="tunnel-cards"></div>
+  </section>
+
+  <!-- ================= İSTEMCİLER ================= -->
+  <section class="view" id="view-clients">
+    <div class="page-head">
+      <div><h1>İstemciler</h1><p class="page-sub">Sertifikasıyla tanınan tüm istemciler — çevrimdışı olanlar dahil.</p></div>
+    </div>
+    <div class="filter-bar"><input type="text" id="client-filter" placeholder="Ad, e-posta veya parmak izi ara…"></div>
+    <div class="table-wrap">
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>İstemci</th><th>Sertifika</th><th>Son görülme</th><th>Durum</th><th></th></tr></thead>
+          <tbody id="clients-body"><tr><td colspan="5" class="empty">yükleniyor…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= UYGULAMALAR ================= -->
+  <section class="view" id="view-apps">
+    <div class="page-head">
+      <div><h1>Uygulamalar</h1><p class="page-sub">Yerel ağdaki hangi adresin, dışarıda hangi porttan yayınlanacağı.</p></div>
+      <button class="btn btn-primary" id="btn-new-app">Uygulama ekle</button>
+    </div>
+    <div class="filter-bar"><input type="text" id="app-filter" placeholder="Ad, yerel adres veya port ara…"></div>
+    <div class="table-wrap">
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Uygulama</th><th>Yerel hedef</th><th>Genel adres</th><th>Teslim</th><th>Bant sınırı</th><th>Trafik</th><th>Durum</th><th></th></tr></thead>
+          <tbody id="apps-body"><tr><td colspan="8" class="empty">yükleniyor…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= PORT HAVUZU ================= -->
+  <section class="view" id="view-ports">
+    <div class="page-head">
+      <div><h1>Port havuzu</h1><p class="page-sub">Dış dünyaya açılan portların tahsis durumu.</p></div>
+    </div>
+    <div class="stats" id="port-stats"></div>
+    <div class="table-wrap">
+      <div class="table-head"><h2>Rezervasyonlar</h2></div>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Port</th><th>Protokol</th><th>Uygulama</th><th>Tünel</th><th>Durum</th><th>Bu tarihten beri</th></tr></thead>
+          <tbody id="ports-body"><tr><td colspan="6" class="empty">yükleniyor…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= KORUMA ================= -->
+  <section class="view" id="view-guard">
+    <div class="page-head">
+      <div><h1>Koruma</h1><p class="page-sub">Kabul sınırları, düşürülen trafik ve yasaklı kaynaklar.</p></div>
+    </div>
+    <div class="stats" id="guard-stats"></div>
+    <div class="table-wrap">
+      <div class="table-head"><h2>Yasaklı kaynaklar</h2></div>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>IP</th><th>İhlal sayısı</th><th>Kalan süre</th><th></th></tr></thead>
+          <tbody id="bans-body"><tr><td colspan="4" class="empty">yükleniyor…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <div class="table-head"><h2>Yürürlükteki sınırlar</h2></div>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Sınır</th><th>Değer</th></tr></thead>
+          <tbody id="guard-limits"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= DENETİM ================= -->
+  <section class="view" id="view-events">
+    <div class="page-head">
+      <div><h1>Denetim kaydı</h1><p class="page-sub">Kim, ne zaman, neyi değiştirdi.</p></div>
+    </div>
+    <div class="table-wrap">
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Zaman</th><th>Olay</th><th>Aktör</th><th>Konu</th><th>Ayrıntı</th></tr></thead>
+          <tbody id="events-body"><tr><td colspan="5" class="empty">yükleniyor…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div class="modal-backdrop" id="modal-backdrop">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal-head" id="modal-title">—</div>
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-foot">
+      <button class="btn" id="modal-cancel">Kapat</button>
+      <button class="btn btn-primary" id="modal-save">Kaydet</button>
+    </div>
+  </div>
+</div>
+
+<script src="/tunnel-console.js"></script>
+</body>
+</html>
