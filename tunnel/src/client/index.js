@@ -44,12 +44,26 @@ class TunnelClient extends EventEmitter {
     super();
     this.options = {
       revocation: 'soft-fail',
+      // 1200 bayt: IPv6'nın asgari MTU'su (1280) eksi IPv6+UDP başlıkları.
+      // Yol MTU keşfine güvenmeden HER yolda parçalanmadan geçen değer;
+      // parçalanmış bir UDP datagramı tek bir parça kaybında tamamen ölür.
       mtu: 1200,
+      /** Şifreleme paketi tercihi — politika adı ya da suite listesi. */
+      cipher: 'balanced',
+      /** Tıkanıklık denetimi: 'bbr3' (varsayılan) ya da 'newreno'. */
+      congestionControl: 'bbr3',
       reconnect: true,
       maxBackoffMs: 30_000,
       name: os.hostname(),
-      ...options,
     };
+    // DİKKAT: nesne yayılımı (`{...defaults, ...options}`) kullanılmıyor.
+    // Çağıran `{ mtu: undefined }` geçtiğinde — ki CLI'da verilmeyen her
+    // seçenek tam olarak böyle gelir — yayılım varsayılanı `undefined` ile
+    // EZER. Sonuç, MTU'su tanımsız bir istemci olur ve hata el sıkışmanın
+    // ortasında, bambaşka bir yerde patlar.
+    for (const [k, v] of Object.entries(options || {})) {
+      if (v !== undefined) this.options[k] = v;
+    }
     this.log = createLogger('tunnel:client');
 
     this.socket = null;
@@ -87,7 +101,12 @@ class TunnelClient extends EventEmitter {
     this.state = 'connecting';
 
     this.log.info('tünel sunucusuna bağlanılıyor', {
-      hedef: `${o.host}:${o.port}`, servername: o.servername, iptalDenetimi: o.revocation,
+      hedef: `${o.host}:${o.port}`,
+      servername: o.servername,
+      iptalDenetimi: o.revocation,
+      sifreleme: o.cipher,
+      tikaniklik: o.congestionControl,
+      mtu: o.mtu,
     });
 
     let socket;
@@ -101,11 +120,13 @@ class TunnelClient extends EventEmitter {
         key: o.identity.privateKeyPem,
         revocation: o.revocation,
         mtu: o.mtu,
+        cipherSuites: o.cipher,
         rejectUnauthorized: true,
         reliable: {
           ordered: false,        // sıra kararı akış başına veriliyor
           maxTrackedPackets: 8192,
           maxRetransmits: 15,
+          congestionControl: o.congestionControl,
         },
       });
     } catch (err) {
@@ -587,6 +608,8 @@ async function startTunnelClient(config) {
     identity,
     revocation: config.revocation,
     mtu: config.mtu,
+    cipher: config.cipher,
+    congestionControl: config.congestionControl,
     name: config.name,
     binds: config.binds,
     limits: config.limits,

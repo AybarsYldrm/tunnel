@@ -111,6 +111,25 @@ module.exports = {
     ],
   },
 
+  /**
+   * Yöneticinin elle engellediği kaynak adresler.
+   *
+   * Otomatik yasaklar (guard.bans) BURAYA YAZILMAZ ve bu bilinçli: onlar hız
+   * sınırı tepkisidir, saniyeler içinde doğar ve sönümlenir; her birini diske
+   * yazmak, bir sel altında veritabanını saldırının kendisi hâline getirirdi.
+   * Burada duran şey insan kararıdır ve yeniden başlatmayı atlatması gerekir.
+   */
+  tunnel_blocklist: {
+    fields: [
+      { no: 2, name: 'address', type: 'string', blindIndex: true, required: true },
+      { no: 3, name: 'reason', type: 'string' },
+      { no: 4, name: 'actor', type: 'string' },
+      { no: 5, name: 'at', type: 'uint64' },
+      /** 0 = kalıcı. */
+      { no: 6, name: 'expiresAt', type: 'uint64' },
+    ],
+  },
+
   /** Panelin grafiklerini besleyen periyodik örnekler. */
   tunnel_metrics: {
     fields: [

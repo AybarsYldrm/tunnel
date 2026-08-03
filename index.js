@@ -43,7 +43,12 @@ const der = require('./src/crypto/der.js');
 const revocation = require('./src/crypto/revocation.js');
 const { SrtpContext, demuxPacket, createSrtpPair } = require('./src/record/srtp.js');
 const { ReliableChannel } = require('./src/reliable/channel.js');
-const { LossRecovery } = require('./src/reliable/recovery.js');
+const { LossRecovery, DEFAULT_CONGESTION_CONTROL } = require('./src/reliable/recovery.js');
+const {
+  createCongestionController, Bbr3Controller, NewRenoController, BBR_DEFAULTS, BBR_STATE,
+} = require('./src/reliable/congestion.js');
+const { Pacer } = require('./src/reliable/pacing.js');
+const cipherSuite = require('./src/crypto/cipher-suite.js');
 const { UdpEndpoint } = require('./src/transport/udp.js');
 const { createStunBindingResponse } = require('./src/transport/stun.js');
 const { setLevel: setLogLevel } = require('./src/logger.js');
@@ -79,9 +84,23 @@ module.exports = {
   createSrtpPair,
   demuxPacket,
   ReliableChannel,
-  LossRecovery,       // RFC 9002 kayıp tespiti + NewReno tıkanıklık denetimi
+  LossRecovery,       // RFC 9002 kayıp tespiti + takılabilir tıkanıklık denetimi
   UdpEndpoint,
   createStunBindingResponse,
+
+  // Tıkanıklık denetimi (varsayılan BBRv3; NewReno seçilebilir)
+  createCongestionController,
+  Bbr3Controller,
+  NewRenoController,
+  Pacer,
+  BBR_DEFAULTS,
+  BBR_STATE,
+  DEFAULT_CONGESTION_CONTROL,
+
+  // Şifreleme paketi seçimi
+  cipherSuite,
+  CIPHER_POLICY: cipherSuite.CIPHER_POLICY,
+  cipherPolicyNames: cipherSuite.cipherPolicyNames,
 
   // PKI / X.509 / iptal denetimi
   pki,

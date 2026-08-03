@@ -4,10 +4,17 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>fitfak tünel — yönetim</title>
-<!-- Stil ve betik ayrı dosyalarda: içerik güvenliği politikası satır içi
-     script/style'a izin vermiyor. Bu, panelde bir XSS bulunsa bile onun
-     çalıştırılabilir bir yük taşımasını engelleyen tek gerçek engel. -->
+<!-- Stil ve betik ayrı dosyalarda; bu sayfada TEK BİR satır içi `style`
+     özniteliği ya da gövdeli bir betik etiketi yoktur.
+     Sebebi yalnızca "politika öyle diyor" değil: `style-src 'self'` ile
+     `script-src 'self'` ancak sayfa gerçekten uyumluysa bir şey ifade eder.
+     Tek bir `style="..."` için `'unsafe-inline'` eklemek zorunda kalmak,
+     bir XSS'in kod çalıştırmasını engelleyen asıl bariyeri kaldırırdı.
+     Dinamik ölçüler (sparkline genişlikleri) JS'ten CSS DEĞİŞKENİ olarak
+     atanır — CSSOM üzerinden stil yazmak CSP kapsamında değildir. -->
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/tunnel-ui.css">
+<script src="/tunnel-console.js" defer></script>
 </head>
 <body>
 
@@ -23,6 +30,7 @@
     <div class="nav-label">Bağlantılar</div>
     <button class="nav-item" data-view="tunnels"><span>Tüneller</span><span class="nav-count" id="count-tunnels">0</span></button>
     <button class="nav-item" data-view="clients"><span>İstemciler</span><span class="nav-count" id="count-clients">0</span></button>
+    <button class="nav-item" data-view="peers"><span>Ziyaretçiler</span><span class="nav-count" id="count-peers">0</span></button>
   </div>
   <div class="nav-group">
     <div class="nav-label">Yayın</div>
@@ -37,8 +45,8 @@
 
   <div class="sidebar-foot">
     <div><span class="live-dot" id="live"></span><span id="live-text">bağlanıyor…</span></div>
-    <div id="whoami" style="margin-top:8px">—</div>
-    <button class="btn btn-sm" id="btn-logout" style="margin-top:10px">Çıkış</button>
+    <div class="sidebar-row" id="whoami">—</div>
+    <button class="btn btn-sm sidebar-action" id="btn-logout">Çıkış</button>
   </div>
 </aside>
 
@@ -83,6 +91,40 @@
         <table>
           <thead><tr><th>İstemci</th><th>Sertifika</th><th>Son görülme</th><th>Durum</th><th></th></tr></thead>
           <tbody id="clients-body"><tr><td colspan="5" class="empty">yükleniyor…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= ZİYARETÇİLER (genel yüzeye bağlananlar) ================= -->
+  <section class="view" id="view-peers">
+    <div class="page-head">
+      <div><h1>Ziyaretçiler</h1><p class="page-sub">Yayındaki portlara dışarıdan bağlanan uçlar — adres, gecikme ve trafik.</p></div>
+      <div class="btn-row">
+        <button class="btn" id="btn-peers-refresh">Yenile</button>
+        <button class="btn" id="btn-block-add">Adres engelle</button>
+      </div>
+    </div>
+    <div class="stats" id="peer-stats"></div>
+    <div class="filter-bar">
+      <input type="text" id="peer-filter" placeholder="IP, port veya uygulama ara…">
+      <label class="inline-check" for="peer-auto"><input type="checkbox" id="peer-auto" checked> Canlı tazele</label>
+    </div>
+    <div class="table-wrap">
+      <div class="table-head"><h2>Açık bağlantılar</h2></div>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Kaynak</th><th>Uygulama</th><th>Genel port</th><th>Gecikme</th><th>Süre</th><th>Trafik</th><th></th></tr></thead>
+          <tbody id="peers-body"><tr><td colspan="7" class="empty">yükleniyor…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <div class="table-head"><h2>Engelli adresler</h2></div>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Adres</th><th>Sebep</th><th>Ekleyen</th><th>Kalan süre</th><th></th></tr></thead>
+          <tbody id="blocklist-body"><tr><td colspan="5" class="empty">yükleniyor…</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -174,7 +216,5 @@
     </div>
   </div>
 </div>
-
-<script src="/tunnel-console.js"></script>
 </body>
 </html>

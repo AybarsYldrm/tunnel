@@ -105,6 +105,9 @@ class PublicUdpEndpoint {
     flow.lastSeen = Date.now();
     flow.packetsIn++;
     flow.bytesIn += msg.length;
+    // Ziyaretçi defteri: UDP'de "bağlantı" akıştır, ama panel açısından fark
+    // yok — aynı adres, aynı gecikme ölçümü, aynı atma düğmesi.
+    if (flow.peer) this.tunnel.server.peers.noteIn(flow.peer, msg.length);
 
     if (this.reliableMode) {
       if (!flow.stream || flow.stream.closed) { this.dropped++; return; }
@@ -151,7 +154,20 @@ class PublicUdpEndpoint {
       established: false,
       announced: false,
       stream: null,
+      peer: null,
     };
+
+    flow.peer = this.tunnel.server.peers.open({
+      appId: this.app.appId,
+      appName: this.app.name,
+      protocol: 'udp',
+      publicPort: this.port,
+      tunnelId: this.tunnel.tunnelId,
+      tunnelName: this.tunnel.displayName,
+      address: rinfo.address,
+      port: rinfo.port,
+      kick: () => this._closeFlow(flow),
+    });
 
     if (this.reliableMode) {
       const stream = this.tunnel.openPublicConnection(this.app, {
@@ -159,7 +175,7 @@ class PublicUdpEndpoint {
         remotePort: rinfo.port,
         udpFlow: flow,
       });
-      if (!stream) return null;
+      if (!stream) { this.tunnel.server.peers.close(flow.peer); return null; }
       flow.stream = stream;
       const deframer = new DatagramDeframer();
       stream.on('data', (chunk) => {
@@ -199,6 +215,7 @@ class PublicUdpEndpoint {
     flow.packetsOut++;
     flow.bytesOut += payload.length;
     this.packetsOut++;
+    if (flow.peer) this.tunnel.server.peers.noteOut(flow.peer, payload.length);
     this.socket.send(payload, flow.port, flow.address, (err) => {
       if (err) this.log.debug('UDP yanıtı gönderilemedi', { err: err.message, port: flow.port });
     });
@@ -216,6 +233,7 @@ class PublicUdpEndpoint {
     this.byId.delete(flow.id);
     this.tunnel.untrackFlow(flow.id);
     this.guard.noteUdpFlowClose(flow.address);
+    if (flow.peer) this.tunnel.server.peers.close(flow.peer);
     if (flow.stream && !flow.stream.closed) flow.stream.reset(RST_CODE.TIMEOUT);
     if (!this.reliableMode) this.tunnel.sendDatagram(frames.frameUdpClose({ flowId: flow.id }));
   }

@@ -64,6 +64,7 @@ const DEFAULTS = Object.freeze({
 
 const REASON = Object.freeze({
   OK: null,
+  BLOCKED: 'blocked',
   BANNED: 'banned',
   ACCEPT_RATE_IP: 'accept-rate-ip',
   ACCEPT_RATE_GLOBAL: 'accept-rate-global',
@@ -98,10 +99,19 @@ class Guard {
     this.connsByApp = new Map();
     this.connsGlobal = 0;
 
-    /** ip -> { count, until } */
+    /** ip -> { count, until } — OTOMATİK, üstel, kendiliğinden sönümlenen. */
     this.bans = new Map();
     /** ip -> { n, at } */
     this.violations = new Map();
+    /**
+     * ip -> { address, reason, actor, at, expiresAt }
+     *
+     * YÖNETİCİNİN elle koyduğu engel. Otomatik yasaktan ayrı tutulur ve
+     * karıştırılmaz: otomatik yasak bir hız sınırı tepkisidir, süresi dolar ve
+     * sönümlenir; elle konan engel bir KARARDIR ve yalnızca yine elle kalkar.
+     * Aynı tabloda tutulsalardı, sweep() yöneticinin kararını sessizce silerdi.
+     */
+    this.blocks = new Map();
 
     this.udpFlowsByIp = new Map();
     this.udpFlowsGlobal = 0;
@@ -110,6 +120,7 @@ class Guard {
       accepted: 0, refused: 0, banned: 0,
       udpAccepted: 0, udpDropped: 0, amplificationBlocked: 0,
       slowlorisKilled: 0, idleKilled: 0,
+      blockedRejections: 0,
     };
     for (const key of Object.values(REASON)) if (key) this.stats[`refused:${key}`] = 0;
 
@@ -154,6 +165,66 @@ class Guard {
   unban(ip) { this.bans.delete(ip); this.violations.delete(ip); }
 
   // -------------------------------------------------------------------------
+  // Elle engelleme (yönetim panelinden)
+  // -------------------------------------------------------------------------
+  /**
+   * @param {string} address
+   * @param {object} [o]
+   * @param {number} [o.ttlMs] 0 / verilmezse KALICI
+   * @param {string} [o.reason]
+   * @param {string} [o.actor] denetim kaydı için
+   * @returns {object} kayıt
+   */
+  blockAddress(address, { ttlMs = 0, reason = '', actor = '', at = Date.now() } = {}) {
+    const ip = String(address || '').trim();
+    if (!ip) throw Object.assign(new Error('adres gerekli'), { status: 400, code: 'invalid_request' });
+    const record = {
+      address: ip,
+      reason: String(reason || '').slice(0, 200),
+      actor: String(actor || '').slice(0, 128),
+      at,
+      expiresAt: ttlMs > 0 ? at + ttlMs : 0,
+    };
+    this.blocks.set(ip, record);
+    this.log?.warn('adres engellendi', { ip, reason: record.reason, actor: record.actor, ttlMs });
+    return record;
+  }
+
+  unblockAddress(address) { return this.blocks.delete(String(address || '').trim()); }
+
+  isBlocked(address, now = Date.now()) {
+    const b = this.blocks.get(address);
+    if (!b) return false;
+    if (b.expiresAt && b.expiresAt <= now) { this.blocks.delete(address); return false; }
+    return true;
+  }
+
+  listBlocks(now = Date.now()) {
+    const out = [];
+    for (const [ip, b] of this.blocks) {
+      if (b.expiresAt && b.expiresAt <= now) { this.blocks.delete(ip); continue; }
+      out.push({ ...b });
+    }
+    return out.sort((a, b) => b.at - a.at);
+  }
+
+  /** Kalıcılıktan geri yükleme — süresi geçmiş kayıtlar atlanır. */
+  loadBlocks(rows = [], now = Date.now()) {
+    for (const row of rows) {
+      if (!row || !row.address) continue;
+      if (row.expiresAt && row.expiresAt <= now) continue;
+      this.blocks.set(row.address, {
+        address: row.address,
+        reason: row.reason || '',
+        actor: row.actor || '',
+        at: Number(row.at) || now,
+        expiresAt: Number(row.expiresAt) || 0,
+      });
+    }
+    return this.blocks.size;
+  }
+
+  // -------------------------------------------------------------------------
   // TCP
   // -------------------------------------------------------------------------
 
@@ -161,6 +232,12 @@ class Guard {
    * @returns {{ok: boolean, reason: string|null}}
    */
   checkAccept(ip, appId, now = Date.now()) {
+    // Elle konan engel en başta denetlenir ve CEZALANDIRMAZ: karar zaten
+    // verilmiş, ayrıca üstel yasak saymanın anlamı yok.
+    if (this.isBlocked(ip, now)) {
+      this.stats.blockedRejections++;
+      return this._refuse(ip, REASON.BLOCKED, false);
+    }
     if (this.isBanned(ip, now)) return this._refuse(ip, REASON.BANNED, false);
 
     if (this.connsGlobal >= this.opt.maxConnectionsGlobal) {
@@ -225,6 +302,11 @@ class Guard {
 
   /** @returns {{ok:boolean, reason:string|null}} */
   checkUdpInbound(ip, bytes, isNewFlow, now = Date.now()) {
+    if (this.isBlocked(ip, now)) {
+      this.stats.udpDropped++;
+      this.stats.blockedRejections++;
+      return { ok: false, reason: REASON.BLOCKED };
+    }
     if (this.isBanned(ip, now)) { this.stats.udpDropped++; return { ok: false, reason: REASON.BANNED }; }
     if (!this.udpPackets.allow(ip, now)) {
       this.stats.udpDropped++;
@@ -299,6 +381,8 @@ class Guard {
       if (now - b.until > this.opt.offenceMemoryMs) this.bans.delete(ip);
     }
     for (const [ip, v] of this.violations) if (now - v.at > this.opt.violationDecayMs) this.violations.delete(ip);
+    // Süreli engeller doldukça düşer; kalıcı olanlara (expiresAt = 0) dokunulmaz.
+    for (const [ip, b] of this.blocks) if (b.expiresAt && b.expiresAt <= now) this.blocks.delete(ip);
   }
 
   snapshot(now = Date.now()) {
@@ -314,6 +398,7 @@ class Guard {
       bannedIps: active,
       rememberedOffenders: this.bans.size,
       watchedIps: this.violations.size,
+      blockedAddresses: this.blocks.size,
     };
   }
 

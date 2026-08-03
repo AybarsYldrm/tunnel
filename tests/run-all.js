@@ -14,6 +14,7 @@ const SUITES = [
   'test-revocation.js',
   'test-srtp.js',
   'test-reliable.js',
+  'test-bbr.js',
   'test-retransmit.js',
   'test-robustness.js',
   // Tünel katmanı: aynı çekirdeği kullanıyor ve aynı test PKI'sına dayanıyor,

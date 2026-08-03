@@ -48,4 +48,15 @@ function asPlainLogger(log) {
   };
 }
 
-module.exports = { createLogger, asPlainLogger, applyLevel, hexDump };
+/**
+ * Seviyeyi AÇIKÇA ayarlar (CLI'daki --quiet gibi). `applyLevel`den farkı,
+ * ortam değişkenini de ezmesi: komut satırında ne yazdıysa o olur.
+ */
+function forceLevel(level) {
+  applied = true;
+  try { setLevel(level); return true; } catch { return false; }
+}
+
+module.exports = {
+  createLogger, asPlainLogger, applyLevel, forceLevel, hexDump,
+};

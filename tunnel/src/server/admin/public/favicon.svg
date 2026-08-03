@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="fitfak tünel">
+  <title>fitfak tünel</title>
+  <!-- Tünelin kendisi: dışarıdan içeriye daralan bir ağız. Koyu zemin, panelin
+       kenar çubuğuyla aynı: sekmeler arasında bir bakışta ayırt edilsin. -->
+  <rect width="32" height="32" rx="7" fill="#0a0a0a"/>
+  <path d="M6 24V15a10 10 0 0 1 20 0v9" fill="none" stroke="#7c74ff" stroke-width="3" stroke-linecap="round"/>
+  <path d="M12 24v-8a4 4 0 0 1 8 0v8" fill="none" stroke="#ffffff" stroke-width="2.5" stroke-linecap="round"/>
+</svg>

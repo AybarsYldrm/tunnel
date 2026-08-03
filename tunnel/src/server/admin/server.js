@@ -29,15 +29,112 @@ const STATIC_TYPES = {
   '.svg': 'image/svg+xml',
 };
 
-const SECURITY_HEADERS = Object.freeze({
-  // Panel kendi kaynaklarından başka hiçbir yere gitmez ve satır içi script
-  // kullanmaz: bir XSS'in dışarı veri sızdırabileceği kanal bırakmıyoruz.
-  'content-security-policy':
-    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
-    + "connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+// ===========================================================================
+// Güvenlik başlıkları
+//
+// Politika `default-src 'none'` ile başlar: hiçbir şeye izin yok, sonra tek tek
+// açılıyor. Tersi ("her şeye izin ver, tehlikelileri kapat") yeni bir kaynak
+// türü eklendiğinde sessizce açık kalır.
+//
+// Satır içi script ve stil YOK — ve bu, sayfanın gerçekten uyduğu bir kural
+// (bkz. public/index.html ve public/tunnel-console.js). Uymasaydı
+// `'unsafe-inline'` eklemek zorunda kalırdık ve o noktada script-src'nin XSS'e
+// karşı hiçbir değeri kalmazdı.
+//
+// `require-trusted-types-for 'script'` bunu tarayıcı seviyesinde MÜHÜRLER:
+// konsol innerHTML'e yazmayı denerse tarayıcı engeller. Sayfa zaten hiç
+// kullanmadığı için bedava gelen, ama gelecekte birinin yanlışlıkla eklemesini
+// imkânsız kılan bir kural.
+//
+// Üçüncü taraf betikler (ör. Cloudflare Web Analytics'in enjekte ettiği
+// beacon.min.js) VARSAYILAN OLARAK ENGELLİ. Açmak isteyen `admin.csp` ile
+// açıkça izin verir — çünkü bu bir güvenlik kararıdır ve sessiz bir varsayılan
+// olarak verilmemelidir. Ayrıntı: _buildCsp().
+// ===========================================================================
+
+/** Cloudflare Web Analytics'in kullandığı kaynaklar (opsiyonel). */
+const CLOUDFLARE_INSIGHTS = Object.freeze({
+  script: 'https://static.cloudflareinsights.com',
+  connect: 'https://cloudflareinsights.com',
+});
+
+const BASE_HEADERS = Object.freeze({
   'x-content-type-options': 'nosniff',
   'referrer-policy': 'no-referrer',
   'x-frame-options': 'DENY',
+  // Tarayıcıya "bu sayfa hiçbir güçlü özelliğe ihtiyaç duymuyor" demek: panelde
+  // bir XSS bulunsa bile kamera/mikrofon/konum isteyemez.
+  'permissions-policy':
+    'accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), '
+    + 'fullscreen=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), '
+    + 'midi=(), payment=(), picture-in-picture=(), usb=(), xr-spatial-tracking=()',
+  // Spectre sınıfı çapraz-köken sızıntılarına karşı yalıtım.
+  'cross-origin-opener-policy': 'same-origin',
+  'cross-origin-resource-policy': 'same-origin',
+  'cross-origin-embedder-policy': 'require-corp',
+  'x-permitted-cross-domain-policies': 'none',
+});
+
+/**
+ * CSP dizesini yapılandırmadan üretir.
+ *
+ * @param {object} [csp] admin.csp
+ * @param {boolean} [csp.cloudflareInsights] Cloudflare beacon'ına izin ver
+ * @param {string[]} [csp.scriptSrc]  ek script kaynakları
+ * @param {string[]} [csp.connectSrc] ek bağlantı hedefleri
+ * @param {string[]} [csp.imgSrc]     ek görsel kaynakları
+ * @param {boolean}  [csp.trustedTypes] varsayılan açık
+ * @param {string}   [csp.reportUri]  ihlal raporları için uç
+ */
+function buildCsp(csp = {}) {
+  const list = (base, extra) => {
+    const out = base.slice();
+    for (const item of extra || []) {
+      const value = String(item).trim();
+      // 'unsafe-inline' ve 'unsafe-eval' YAPILANDIRMAYLA DA AÇILAMAZ. Bunlar
+      // "biraz daha esnek" ayarlar değil, politikanın tamamını anlamsız kılan
+      // anahtarlardır; bir yapılandırma hatasının onları açabilmesi, elimizdeki
+      // tek gerçek XSS bariyerini bir yazım hatasına bağlamak olurdu.
+      if (/^'unsafe-(inline|eval|hashes)'$/i.test(value)) continue;
+      if (value && !out.includes(value)) out.push(value);
+    }
+    return out;
+  };
+
+  const scriptSrc = list(["'self'"], csp.scriptSrc);
+  const connectSrc = list(["'self'"], csp.connectSrc);
+  const imgSrc = list(["'self'", 'data:'], csp.imgSrc);
+
+  if (csp.cloudflareInsights) {
+    // Beacon, Cloudflare'in HTML'e enjekte ettiği harici bir `<script src>`tir;
+    // nonce ile çözülemez (etiketi biz üretmiyoruz). Doğru çözüm, TEK bir
+    // kaynağı ada göre listelemek — 'unsafe-inline' açmak değil.
+    if (!scriptSrc.includes(CLOUDFLARE_INSIGHTS.script)) scriptSrc.push(CLOUDFLARE_INSIGHTS.script);
+    if (!connectSrc.includes(CLOUDFLARE_INSIGHTS.connect)) connectSrc.push(CLOUDFLARE_INSIGHTS.connect);
+  }
+
+  const directives = [
+    "default-src 'none'",
+    `script-src ${scriptSrc.join(' ')}`,
+    "style-src 'self'",
+    `img-src ${imgSrc.join(' ')}`,
+    `connect-src ${connectSrc.join(' ')}`,
+    "font-src 'self'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+    "base-uri 'none'",
+    "object-src 'none'",
+    "manifest-src 'self'",
+  ];
+  if (csp.trustedTypes !== false) directives.push("require-trusted-types-for 'script'");
+  if (csp.reportUri) directives.push(`report-uri ${csp.reportUri}`);
+  return directives.join('; ');
+}
+
+/** Yapılandırma verilmemiş kurulumlar için hazır politika. */
+const SECURITY_HEADERS = Object.freeze({
+  'content-security-policy': buildCsp(),
+  ...BASE_HEADERS,
 });
 
 class AdminServer {
@@ -49,6 +146,13 @@ class AdminServer {
     this.http = null;
     this.origins = [];
     this._sseClients = new Set();
+    // Politika süreç başında BİR KEZ kurulur: istek başına dize birleştirmek,
+    // hem boşuna iş hem de yapılandırmanın çalışma anında değişebileceği
+    // izlenimi verirdi.
+    this.headers = Object.freeze({
+      'content-security-policy': buildCsp(config.csp),
+      ...BASE_HEADERS,
+    });
   }
 
   async start() {
@@ -99,7 +203,7 @@ class AdminServer {
 
   // =========================================================================
   async _handle(req, res) {
-    for (const [k, v] of Object.entries(SECURITY_HEADERS)) res.setHeader(k, v);
+    for (const [k, v] of Object.entries(this.headers)) res.setHeader(k, v);
 
     const url = new URL(req.url, `http://${this.config.host}`);
     const p = url.pathname.replace(/\/+$/, '') || '/';
@@ -124,6 +228,9 @@ class AdminServer {
     if (p === '/' || p === '/index.html') return this._static(res, 'index.html');
     if (p === '/tunnel-ui.css') return this._static(res, 'tunnel-ui.css');
     if (p === '/tunnel-console.js') return this._static(res, 'tunnel-console.js');
+    // Tarayıcı bunu istemeden edemez; sunmazsak her sayfa açılışında konsola
+    // bir 404 düşer ve gerçek hataları gürültüye gömer.
+    if (p === '/favicon.svg' || p === '/favicon.ico') return this._static(res, 'favicon.svg');
 
     if (p.startsWith('/api/')) return this._api(req, res, url, p, session);
 
@@ -237,6 +344,43 @@ class AdminServer {
     if (match && m === 'POST') {
       const body = await readJson(req);
       return this._json(res, 200, await this.tunnelServer.setClientBlocked(match[1], !!body.blocked, { actor }));
+    }
+
+    // -- ziyaretçiler (genel yüzeye dışarıdan bağlananlar)
+    if (p === '/api/peers' && m === 'GET') {
+      return this._json(res, 200, {
+        peers: this.tunnelServer.peers.list({
+          appId: url.searchParams.get('appId') || null,
+          address: url.searchParams.get('address') || null,
+          limit: Math.min(Number(url.searchParams.get('limit')) || 500, 2000),
+        }),
+        stats: {
+          ...this.tunnelServer.peers.snapshot(),
+          blockedRejections: this.tunnelServer.guard.stats.blockedRejections,
+        },
+      });
+    }
+
+    match = /^\/api\/peers\/([A-Za-z0-9_-]+)\/kick$/.exec(p);
+    if (match && m === 'POST') {
+      return this._json(res, 200, await this.tunnelServer.kickPeer(match[1], { actor }));
+    }
+
+    if (p === '/api/blocklist' && m === 'GET') {
+      return this._json(res, 200, { blocklist: this.tunnelServer.guard.listBlocks() });
+    }
+    if (p === '/api/blocklist' && m === 'POST') {
+      const body = await readJson(req);
+      return this._json(res, 200, await this.tunnelServer.blockAddress(body.address, {
+        ttlMs: Math.max(0, Number(body.ttlMs) || 0),
+        reason: body.reason || '',
+        actor,
+      }));
+    }
+    match = /^\/api\/blocklist\/(.+)$/.exec(p);
+    if (match && m === 'DELETE') {
+      const address = decodeURIComponent(match[1]);
+      return this._json(res, 200, await this.tunnelServer.unblockAddress(address, { actor }));
     }
 
     // -- uygulamalar
@@ -402,4 +546,6 @@ function escapeHtml(s) {
   }[c]));
 }
 
-module.exports = { AdminServer };
+module.exports = {
+  AdminServer, SECURITY_HEADERS, BASE_HEADERS, buildCsp, CLOUDFLARE_INSIGHTS,
+};

@@ -93,6 +93,103 @@ const DEFAULT_SUITES_12 = Object.freeze([
 // Geriye dönük uyum — eski kod bu adı bekliyordu.
 const DEFAULT_SERVER_PRIORITY = DEFAULT_SUITES_13;
 
+// ===========================================================================
+// Adlandırılmış şifreleme politikaları
+//
+// Tek tek suite ID'si yazmak, kullanıcıyı DTLS 1.3 ve 1.2 listelerini elle
+// eşlemeye zorlar; bir tanesini unutmak "el sıkışma başarısız" olarak geri
+// döner ve sebebi görünmez. Politika adı bu eşlemeyi tek yerde yapar.
+//
+// Hangi politika ne zaman:
+//
+//   balanced   (varsayılan) AES-128-GCM önce. AES-NI olan her makinede — yani
+//              2010 sonrası hemen her sunucu ve masaüstünde — en hızlısı.
+//   aes256     Daha uzun anahtar isteyen kurumsal politikalar için. AES-128'in
+//              kırıldığına dair bir bulgu YOKTUR; bu bir uyum tercihidir,
+//              güvenlik yükseltmesi değil.
+//   chacha20   AES donanım hızlandırması OLMAYAN uçlar için: ARM Cortex-A
+//              (eski Raspberry Pi), bazı gömülü yönlendiriciler, düşük seviye
+//              mobil yongalar. Oralarda ChaCha20 AES'ten kat kat hızlıdır ve
+//              yazılım AES'in önbellek zamanlaması sızıntısı riski de yoktur.
+//   mobile     ChaCha20 önce, AES yedek — karışık istemci parkı için doğru
+//              olan: hızlı ucun seçimini yavaş uca dayatmıyoruz.
+//   fips       Yalnızca AES-GCM. ChaCha20-Poly1305 FIPS 140-3 onaylı değildir.
+//
+// Politika SIRALAMADIR, yasak listesi değil: sunucu kendi sırasına göre
+// istemcinin sunduklarından ilk eşleşeni seçer (selectSuite).
+// ===========================================================================
+const CIPHER_POLICY = Object.freeze({
+  balanced: [
+    CIPHER_SUITE.TLS_AES_128_GCM_SHA256,
+    CIPHER_SUITE.TLS_AES_256_GCM_SHA384,
+    CIPHER_SUITE.TLS_CHACHA20_POLY1305_SHA256,
+    CIPHER_SUITE.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+    CIPHER_SUITE.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+    CIPHER_SUITE.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+    CIPHER_SUITE.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+    CIPHER_SUITE.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+    CIPHER_SUITE.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+  ],
+  aes128: [
+    CIPHER_SUITE.TLS_AES_128_GCM_SHA256,
+    CIPHER_SUITE.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+    CIPHER_SUITE.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+  ],
+  aes256: [
+    CIPHER_SUITE.TLS_AES_256_GCM_SHA384,
+    CIPHER_SUITE.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+    CIPHER_SUITE.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+  ],
+  aes: [
+    CIPHER_SUITE.TLS_AES_128_GCM_SHA256,
+    CIPHER_SUITE.TLS_AES_256_GCM_SHA384,
+    CIPHER_SUITE.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+    CIPHER_SUITE.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+    CIPHER_SUITE.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+    CIPHER_SUITE.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+  ],
+  chacha20: [
+    CIPHER_SUITE.TLS_CHACHA20_POLY1305_SHA256,
+    CIPHER_SUITE.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+    CIPHER_SUITE.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+  ],
+  mobile: [
+    CIPHER_SUITE.TLS_CHACHA20_POLY1305_SHA256,
+    CIPHER_SUITE.TLS_AES_128_GCM_SHA256,
+    CIPHER_SUITE.TLS_AES_256_GCM_SHA384,
+    CIPHER_SUITE.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+    CIPHER_SUITE.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+    CIPHER_SUITE.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+    CIPHER_SUITE.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+  ],
+});
+
+/** Takma adlar — kullanıcı 'chacha' ya da 'aes-128' yazdığında da çalışsın. */
+const POLICY_ALIASES = Object.freeze({
+  default: 'balanced', auto: 'balanced', balanced: 'balanced',
+  aes: 'aes', 'aes-gcm': 'aes', fips: 'aes',
+  aes128: 'aes128', 'aes-128': 'aes128', 'aes128gcm': 'aes128', 'aes-128-gcm': 'aes128',
+  aes256: 'aes256', 'aes-256': 'aes256', 'aes256gcm': 'aes256', 'aes-256-gcm': 'aes256',
+  strong: 'aes256',
+  chacha: 'chacha20', chacha20: 'chacha20', 'chacha20-poly1305': 'chacha20',
+  poly1305: 'chacha20',
+  mobile: 'mobile', 'chacha-first': 'mobile', arm: 'mobile', embedded: 'mobile',
+});
+
+/**
+ * Politika adını suite listesine çevirir.
+ * @param {string} name
+ * @returns {number[]|null} tanınmayan ad için null (arayan suite adı sanabilir)
+ */
+function resolveCipherPolicy(name) {
+  if (typeof name !== 'string') return null;
+  const key = POLICY_ALIASES[name.trim().toLowerCase()];
+  return key ? CIPHER_POLICY[key].slice() : null;
+}
+
+/** Kullanıcıya gösterilecek politika adları. */
+function cipherPolicyNames() { return Object.keys(CIPHER_POLICY); }
+
 function getSuite(id) {
   const s = SUITES[id];
   if (!s) throw new Error(`unsupported cipher suite: 0x${id.toString(16)}`);
@@ -143,5 +240,7 @@ function suiteName(id) {
 module.exports = {
   SUITES,
   DEFAULT_SUITES_13, DEFAULT_SUITES_12, DEFAULT_SERVER_PRIORITY,
+  CIPHER_POLICY, POLICY_ALIASES,
   getSuite, findSuite, selectSuite, resolveSuiteId, suiteName,
+  resolveCipherPolicy, cipherPolicyNames,
 };
