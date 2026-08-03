@@ -125,6 +125,11 @@ class Tunnel extends EventEmitter {
   get revocation() { return this.socket.peerRevocation || null; }
   get ready() { return this.state === 'ready'; }
 
+  /** Panelde ve ziyaretçi defterinde gösterilecek ad. */
+  get displayName() {
+    return this.clientInfo?.name || this.identity?.commonName || this.clientId.slice(0, 16);
+  }
+
   // =========================================================================
   // Denetim düzlemi
   // =========================================================================
@@ -448,7 +453,7 @@ class Tunnel extends EventEmitter {
    * @returns {import('../common/mux.js').TunnelStream|null}
    */
   openPublicConnection(app, {
-    remoteAddress, remotePort, socket = null,
+    remoteAddress, remotePort, socket = null, peer = null,
   }) {
     if (!this.ready || !app.enabled) return null;
     if (app.maxConns && app.activeConnections >= app.maxConns) {
@@ -485,7 +490,16 @@ class Tunnel extends EventEmitter {
         egressBucket: app.bucketOut,
         idleMs: app.idleMs,
         onBytes: (dir, bytes) => {
-          if (dir === 'in') { app.meterIn.add(bytes); this.meterIn.add(bytes); } else { app.meterOut.add(bytes); this.meterOut.add(bytes); }
+          if (dir === 'in') {
+            app.meterIn.add(bytes);
+            this.meterIn.add(bytes);
+            // Ziyaretçiden gelen bayt: pasif tur süresi örneği burada doğar.
+            if (peer) this.server.peers.noteIn(peer, bytes);
+          } else {
+            app.meterOut.add(bytes);
+            this.meterOut.add(bytes);
+            if (peer) this.server.peers.noteOut(peer, bytes);
+          }
         },
       });
     }
@@ -573,6 +587,10 @@ class Tunnel extends EventEmitter {
         rttMs: mux.rttMs,
         minRttMs: mux.minRttMs,
         appRttMs: mux.appRttMs,
+        congestionControl: mux.congestionControl,
+        ccState: mux.ccState,
+        bandwidthBps: mux.bandwidthBps,
+        pacingRateBps: mux.pacingRateBps,
         congestionWindow: mux.congestionWindow,
         bytesInFlight: mux.bytesInFlight,
         packetsSent: mux.packetsSent,

@@ -17,6 +17,23 @@ export type CipherSuiteName =
   | 'TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256'
   | 'TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256';
 
+/**
+ * Adlandırılmış şifreleme politikası — DTLS 1.3 ve 1.2 karşılıklarını birlikte,
+ * doğru sırayla kurar.
+ *
+ *   balanced  (varsayılan) AES-128-GCM önce; AES-NI olan makinelerde en hızlı
+ *   aes128 / aes256 / aes   yalnızca AES-GCM (FIPS uyumlu seçim)
+ *   chacha20  yalnızca ChaCha20-Poly1305 — AES hızlandırması olmayan uçlar
+ *   mobile    ChaCha20 önce, AES yedek — karışık istemci parkı
+ */
+export type CipherPolicyName =
+  | 'balanced' | 'default' | 'auto'
+  | 'aes' | 'aes-gcm' | 'fips'
+  | 'aes128' | 'aes-128' | 'aes128gcm' | 'aes-128-gcm'
+  | 'aes256' | 'aes-256' | 'aes256gcm' | 'aes-256-gcm' | 'strong'
+  | 'chacha' | 'chacha20' | 'chacha20-poly1305' | 'poly1305'
+  | 'mobile' | 'chacha-first' | 'arm' | 'embedded';
+
 export type SrtpProfileName =
   | 'SRTP_AES128_CM_HMAC_SHA1_80'
   | 'SRTP_AES128_CM_HMAC_SHA1_32'
@@ -76,10 +93,55 @@ export interface SrtpOptions {
  * Kayıp tespiti paket eşiği (3) + zaman eşiği (9/8·RTT) ile, gönderim hızı
  * NewReno tıkanıklık penceresiyle yönetilir; zamanaşımı PTO'dur.
  */
+/**
+ * Tıkanıklık denetleyicisi.
+ *
+ *  - `bbr3`    (varsayılan) BBRv3 — darboğaz bant genişliğini ve en küçük
+ *              gecikmeyi ÖLÇER, kaybı tıkanıklık saymaz. Kayıplı ve uzun
+ *              mesafeli hatlarda NewReno'ya göre kat kat verim; derin
+ *              tamponlarda kuyruk gecikmesi üretmez.
+ *  - `newreno` RFC 9002 §7 — kayıp odaklı, klasik davranış.
+ */
+export type CongestionControlName =
+  | 'bbr3' | 'bbr' | 'bbrv3' | 'bbr-v3'
+  | 'newreno' | 'new-reno' | 'reno' | 'rfc9002';
+
+/** BBRv3 ince ayarları — varsayılanlar `BBR_DEFAULTS`. */
+export interface BbrOptions {
+  startupPacingGain?: number;
+  startupCwndGain?: number;
+  drainPacingGain?: number;
+  cwndGain?: number;
+  probeRttCwndGain?: number;
+  minRttWindowMs?: number;
+  probeRttDurationMs?: number;
+  lossThresh?: number;
+  beta?: number;
+  headroom?: number;
+  fullBwThresh?: number;
+  fullBwCnt?: number;
+  fullLossCnt?: number;
+  pacingMargin?: number;
+  minLossSamplePackets?: number;
+  bwProbeWaitMs?: number;
+  [key: string]: number | undefined;
+}
+
 export interface ReliableOptions {
   enabled?: boolean;
   /** Varsayılan false → SIRASIZ teslim (head-of-line blocking yok). */
   ordered?: boolean;
+  /** Tıkanıklık denetimi; varsayılan `bbr3`. */
+  congestionControl?: CongestionControlName;
+  /** `congestionControl` için kısa ad. */
+  cc?: CongestionControlName;
+  /**
+   * Hız şekillendirme (pacing). Verilmezse denetleyici karar verir: BBR açık,
+   * NewReno kapalı. BBR için kapatmak önerilmez — model ölçtüğü hızda
+   * göndermeyi ancak paketleri zamana yayarak yapabilir.
+   */
+  pacing?: boolean;
+  bbr?: BbrOptions;
   /** Çerçeve başına yük sınırı; varsayılan mtu - 64. */
   mtu?: number;
   /** RTT örneği alınana kadarki başlangıç tahmini (ms, varsayılan 333). */
@@ -202,7 +264,19 @@ export interface CommonOptions extends SecureContextOptions {
   /** Leaf sertifikanın EKU amacını (serverAuth/clientAuth) doğrula (varsayılan true). */
   checkPurpose?: boolean;
 
-  cipherSuites?: Array<CipherSuiteName | number>;
+  /**
+   * Şifreleme paketi tercihi. Üç biçim de kabul edilir:
+   *
+   *   'chacha20'                        adlandırılmış politika
+   *   ['TLS_AES_128_GCM_SHA256', ...]   açık liste (ad ya da sayısal ID)
+   *   ['chacha20', 'aes128']            politikaların birleşimi
+   *
+   * Sıra ÖNEMLİDİR: sunucu bunu tercih sırası olarak kullanır. Politika adı
+   * DTLS 1.3 ve 1.2 karşılıklarını birlikte kurar.
+   */
+  cipherSuites?: CipherPolicyName | Array<CipherSuiteName | CipherPolicyName | number>;
+  /** `cipherSuites` ile eşanlamlı — yapılandırma dosyaları için kısa ad. */
+  cipher?: CipherPolicyName | Array<CipherSuiteName | CipherPolicyName | number>;
   groups?: Array<NamedGroupName | number>;
   sigSchemes?: Array<string | number>;
   alpn?: string | string[];
@@ -262,6 +336,12 @@ export interface ReliableStats {
   lost: number;
 }
 
+/** BBR modelinin evresi. */
+export type BbrState =
+  | 'startup' | 'drain'
+  | 'probe-bw-down' | 'probe-bw-cruise' | 'probe-bw-refill' | 'probe-bw-up'
+  | 'probe-rtt';
+
 /** `channel.getStats()` — ReliableStats + RFC 9002 kurtarma göstergeleri. */
 export interface RecoveryStats extends ReliableStats {
   smoothedRtt: number;
@@ -281,6 +361,26 @@ export interface RecoveryStats extends ReliableStats {
   probesSent: number;
   congestionEvents: number;
   persistentCongestion: number;
+  bytesLost: number;
+
+  /** Yürürlükteki denetleyici: 'bbr3' ya da 'newreno'. */
+  cc: 'bbr3' | 'newreno';
+  /** Denetleyicinin durumu — BBR'da evre adı, NewReno'da 'slow-start'/'avoidance'. */
+  state: BbrState | 'slow-start' | 'avoidance';
+  /** Ölçülen darboğaz bant genişliği (bayt/s). NewReno'da null. */
+  bandwidthBps: number | null;
+  /** Hedef gönderim hızı (bayt/s). Şekillendirme kapalıysa null. */
+  pacingRateBps: number | null;
+  pacingEnabled: boolean;
+  /** Uygulama veri üretemediği için hattı boş bıraktık mı. */
+  appLimited: boolean;
+  /** BBR: bant genişliği-gecikme çarpımı (bayt). */
+  bdp?: number | null;
+  /** BBR: ACK yığılması telafisi (bayt). */
+  extraAcked?: number;
+  /** BBR: başlangıç evresinden çıkış sebebi. */
+  startupExit?: 'bandwidth-plateau' | 'loss' | null;
+  probeRttCount?: number;
 }
 
 export interface ReliableChannel extends EventEmitter {
@@ -288,6 +388,10 @@ export interface ReliableChannel extends EventEmitter {
   readonly rttMs: number | null;
   readonly inFlight: number;
   readonly congestionWindow: number;
+  /** Hedef gönderim hızı (bayt/s); şekillendirme kapalıysa null. */
+  readonly pacingRate: number | null;
+  /** Yürürlükteki tıkanıklık denetleyicisinin adı. */
+  readonly congestionControl: 'bbr3' | 'newreno';
   getStats(): RecoveryStats;
   sendMessage(data: Buffer, opts?: SendOptions): Promise<number>;
   sendUnreliable(data: Buffer): unknown;

@@ -1,6 +1,6 @@
 'use strict';
 // Kayıp tespiti ve tıkanıklık denetimi — RFC 9002 (QUIC Loss Detection and
-// Congestion Control) uyarlaması.
+// Congestion Control) uyarlaması + BBRv3 tıkanıklık modeli.
 //
 // Neden RFC 9002? "Kaybolan paketi yeniden gönder" tek başına bir kurtarma
 // stratejisi DEĞİLDİR. Ağır kayıp altında (%50 gibi) naif bir zamanlayıcı
@@ -14,24 +14,37 @@
 //      RFC 9002 §6.2 bunu PTO ile ayırır: PTO yalnızca "sonda" (probe)
 //      gönderir, kayıp İLAN ETMEZ ve tıkanıklık penceresini küçültmez.
 //   3. AÇIK DÖNGÜ GÖNDERİM — sabit `maxInFlight` ne ağın kapasitesini
-//      kullanır ne de tıkanıklığa tepki verir. RFC 9002 §7 (NewReno)
-//      pencereyi ACK'lerle büyütür, kayıpta yarıya indirir.
+//      kullanır ne de tıkanıklığa tepki verir.
 //
-// Bu modül üç kavramı ayrı tutar (RFC 9002'nin kendi ayrımı):
-//   • RTT tahmini      §5  — smoothed_rtt / rttvar / min_rtt, ack_delay düşülür
-//   • Kayıp tespiti    §6  — paket eşiği (3) + zaman eşiği (9/8 × RTT) + PTO
-//   • Tıkanıklık       §7  — NewReno: yavaş başlangıç, kurtarma, kalıcı tıkanıklık
+// Bu modül DÖRT kavramı ayrı tutar:
+//   • RTT tahmini      §5   — smoothed_rtt / rttvar / min_rtt, ack_delay düşülür
+//   • Kayıp tespiti    §6   — paket eşiği (3) + zaman eşiği (9/8 × RTT) + PTO
+//   • Tıkanıklık       §7   — TAKILABİLİR: BBRv3 (varsayılan) ya da NewReno
+//   • Hız şekillendirme      pacer — pencereyi zamana yayar (BBR için zorunlu)
+//
+// Tıkanıklık denetiminin ayrı bir dosyada (congestion.js) ve takılabilir
+// olmasının sebebi: kayıp tespiti bir PROTOKOL kuralıdır, tıkanıklık denetimi
+// bir POLİTİKADIR. İkisini aynı sınıfta birleştirmek, politikayı değiştirmek
+// isteyen herkesi protokole dokunmaya zorlar.
 //
 // QUIC'ten devralınan can alıcı tasarım kuralı: YENİDEN GÖNDERİLEN VERİ YENİ
 // BİR PAKET NUMARASI ALIR. Böylece her ACK tek bir gönderime karşılık gelir ve
 // RTT örneği belirsizliğe düşmez (Karn algoritmasına gerek kalmaz).
 
+const {
+  createCongestionController, RateSampler,
+  initialWindow, minimumWindow, kLossReductionFactor,
+} = require('./congestion.js');
+const { Pacer } = require('./pacing.js');
+
 const kPacketThreshold = 3;             // RFC 9002 §6.1.1
 const kTimeThreshold = 9 / 8;           // RFC 9002 §6.1.2
 const kGranularity = 1;                 // ms — zamanlayıcı çözünürlüğü
 const kInitialRtt = 333;                // ms — RFC 9002 §6.2.2
-const kLossReductionFactor = 0.5;       // RFC 9002 §7.3.2
 const kPersistentCongestionThreshold = 3; // RFC 9002 §7.6
+
+/** Varsayılan tıkanıklık denetleyicisi. Gerekçesi congestion.js başında. */
+const DEFAULT_CONGESTION_CONTROL = 'bbr3';
 
 class LossRecovery {
   /**
@@ -41,10 +54,14 @@ class LossRecovery {
    * @param {number} [o.initialRtt]
    * @param {number} [o.minPto]           PTO alt sınırı (test/LAN için)
    * @param {number} [o.maxPto]           PTO üst sınırı
+   * @param {'bbr3'|'newreno'} [o.congestionControl]
+   * @param {boolean} [o.pacing]          BBR ile varsayılan açık
+   * @param {object} [o.bbr]              BBR ince ayarları (congestion.js)
    */
   constructor({
     maxDatagramSize = 1200, maxAckDelay = 25, initialRtt = kInitialRtt,
     minPto = 2 * kGranularity, maxPto = 8_000,
+    congestionControl = DEFAULT_CONGESTION_CONTROL, pacing, bbr,
   } = {}) {
     this.maxDatagramSize = maxDatagramSize;
     this.maxAckDelay = maxAckDelay;
@@ -66,16 +83,41 @@ class LossRecovery {
     this.lossTime = 0;              // 0 = ayarlanmamış
     this.ptoCount = 0;
 
-    // --- tıkanıklık (§7, NewReno)
-    this.congestionWindow = initialWindow(maxDatagramSize);
+    // --- tıkanıklık (§7) — takılabilir
+    this.cc = createCongestionController(congestionControl, {
+      maxDatagramSize, initialRtt, bbr,
+    });
     this.bytesInFlight = 0;
-    this.ssthresh = Infinity;
-    this.congestionRecoveryStartTime = 0;
+
+    // --- hız şekillendirme
+    // NewReno pacer istemiyorsa kapalı kalır: pencere zaten patlamayı
+    // sınırlıyor ve NewReno'nun ölçtüğü bir hedef hız yok.
+    const wantPacing = pacing === undefined ? this.cc.name === 'bbr3' : !!pacing;
+    this.pacer = wantPacing ? new Pacer({ maxDatagramSize }) : null;
+    this.rateSampler = new RateSampler();
 
     this.stats = {
       packetsSent: 0, packetsAcked: 0, packetsLost: 0, probesSent: 0,
       congestionEvents: 0, persistentCongestion: 0, spuriousLoss: 0,
+      bytesLost: 0,
     };
+  }
+
+  // ==========================================================================
+  // Pencere — denetleyiciye vekâlet
+  // ==========================================================================
+  get congestionWindow() { return this.cc.cwnd; }
+  set congestionWindow(v) { this.cc.cwnd = v; }
+
+  /** NewReno'da eşik, BBR'da null (kavram yok). */
+  get ssthresh() { return this.cc.ssthresh === undefined ? Infinity : this.cc.ssthresh; }
+  set ssthresh(v) { this.cc.ssthresh = v; }
+
+  get congestionControl() { return this.cc.name; }
+
+  /** Hedef gönderim hızı (bayt/s) — şekillendirme kapalıysa null. */
+  get pacingRate() {
+    return this.pacer && this.pacer.enabled ? this.pacer.rate : null;
   }
 
   // ==========================================================================
@@ -90,24 +132,58 @@ class LossRecovery {
    */
   onPacketSent({ pn, bytes, ackEliciting = true, meta = null, now = Date.now() }) {
     const entry = { pn, bytes, sentTime: now, ackEliciting, inFlight: ackEliciting, meta };
+
+    // Teslim hızı örneklemesi paketin ÜZERİNE yazılır: ACK geldiğinde o anki
+    // bağlantı durumuyla karşılaştırılıp gerçek teslim hızı çıkarılır.
+    this.rateSampler.onPacketSent(entry, this.bytesInFlight, now);
+    this.cc.onPacketSent({ entry, bytesInFlight: this.bytesInFlight, now });
+
     this.sent.set(pn, entry);
     this.stats.packetsSent++;
     if (entry.inFlight) {
       this.bytesInFlight += bytes;
       this.timeOfLastAckElicitingPacket = now;
     }
+    if (this.pacer) this.pacer.onSent(bytes, now);
     return entry;
   }
 
   /** Tıkanıklık penceresinde kalan yer (bayt). Negatif olabilir. */
-  available() { return this.congestionWindow - this.bytesInFlight; }
+  available() { return this.cc.cwnd - this.bytesInFlight; }
 
-  /** Bu boyutta bir paket şu an gönderilebilir mi? */
-  canSend(bytes) {
+  /** Pencere bu boyutta bir pakete yer veriyor mu (hız şekillendirme HARİÇ). */
+  hasCongestionRoom(bytes) {
     // Pencere tamamen doluyken bile en az bir paket akmalı; aksi hâlde
     // ilk kayıp sonrası bağlantı kalıcı olarak kilitlenebilir.
-    return this.bytesInFlight === 0 || this.bytesInFlight + bytes <= this.congestionWindow;
+    return this.bytesInFlight === 0 || this.bytesInFlight + bytes <= this.cc.cwnd;
   }
+
+  /** Bu boyutta bir paket şu an gönderilebilir mi (pencere + hız). */
+  canSend(bytes, now = Date.now()) {
+    if (!this.hasCongestionRoom(bytes)) return false;
+    if (!this.pacer) return true;
+    return this.pacer.canSend(bytes, now);
+  }
+
+  /**
+   * Hız şekillendiricinin izin vermesine kalan süre (ms).
+   * @returns {number} 0 = şimdi gönderilebilir
+   */
+  pacingDelay(bytes, now = Date.now()) {
+    if (!this.pacer) return 0;
+    return this.pacer.delayUntilSend(bytes, now);
+  }
+
+  /**
+   * Gönderecek veri kalmadı: bundan sonraki teslim hızı örnekleri AĞIN değil
+   * UYGULAMANIN sınırını ölçer. İşaretlenmezse BBR, boş kalan hattı yavaş bir
+   * hat sanır ve hızı kalıcı olarak düşürür.
+   */
+  markAppLimited() {
+    this.rateSampler.markAppLimited(this.bytesInFlight);
+  }
+
+  get isAppLimited() { return this.rateSampler.isAppLimited; }
 
   // ==========================================================================
   // ACK işleme — RFC 9002 §5.1, §6.1
@@ -151,12 +227,42 @@ class LossRecovery {
       this._updateRtt(now - largestNewlyAckedEntry.sentTime, ackDelay, now);
     }
 
-    for (const e of acked) if (e.inFlight) this.bytesInFlight -= e.bytes;
+    // --- teslim hızı örneği: ACK'lenen paketler sırayla işlenir
+    this.rateSampler.beginAck();
+    let ackedBytes = 0;
+    for (const e of acked) {
+      if (e.inFlight) this.bytesInFlight -= e.bytes;
+      ackedBytes += e.bytes;
+      this.rateSampler.onPacketAcked(e, now);
+    }
     this.stats.packetsAcked += acked.length;
-    this._onPacketsAcked(acked, now);
 
+    // Kayıp tespiti ACK'ten SONRA yapılır: ACK bilgisi olmadan hangi paketin
+    // geride kaldığı bilinemez.
     const lost = this._detectAndRemoveLostPackets(now);
-    if (lost.length) this._onPacketsLost(lost, now);
+    let bytesLost = 0;
+    if (lost.length) bytesLost = this._accountLoss(lost);
+
+    const rs = this.rateSampler.endAck(this.hasRttSample ? this.minRtt : 0);
+
+    const ctx = {
+      acked,
+      lost,
+      rs,
+      ackedBytes,
+      delivered: this.rateSampler.delivered,
+      bytesInFlight: this.bytesInFlight,
+      bytesLost,
+      packetsLost: lost.length,
+      minRtt: this.hasRttSample ? this.minRtt : this.smoothedRtt,
+      latestRtt: this.latestRtt,
+      smoothedRtt: this.smoothedRtt,
+      now,
+    };
+
+    this.cc.onAck(ctx);
+    if (lost.length) this._applyLoss(lost, ctx);
+    this._syncPacer();
 
     // İlerleme oldu → PTO geri çekilmesi sıfırlanır (§6.2.1).
     this.ptoCount = 0;
@@ -185,6 +291,12 @@ class LossRecovery {
 
     this.rttvar = 0.75 * this.rttvar + 0.25 * Math.abs(this.smoothedRtt - adjusted);
     this.smoothedRtt = 0.875 * this.smoothedRtt + 0.125 * adjusted;
+  }
+
+  /** Denetleyicinin hedef hızını şekillendiriciye aktarır. */
+  _syncPacer() {
+    if (!this.pacer) return;
+    this.pacer.setRate(this.cc.pacingRate);
   }
 
   // ==========================================================================
@@ -247,7 +359,13 @@ class LossRecovery {
   onLossDetectionTimeout(now = Date.now()) {
     if (this.lossTime !== 0 && this.lossTime <= now) {
       const lost = this._detectAndRemoveLostPackets(now);
-      if (lost.length) this._onPacketsLost(lost, now);
+      if (lost.length) {
+        const bytesLost = this._accountLoss(lost);
+        this._applyLoss(lost, {
+          lost, bytesLost, packetsLost: lost.length, bytesInFlight: this.bytesInFlight, now,
+        });
+        this._syncPacer();
+      }
       return { lost, probes: 0 };
     }
     if (!this._hasAckElicitingInFlight()) return { lost: [], probes: 0 };
@@ -256,65 +374,50 @@ class LossRecovery {
     // Bu bir kayıp bildirimi DEĞİLDİR — pencere küçültülmez.
     this.ptoCount++;
     this.stats.probesSent += 2;
+    this.cc.onPtoExpired({ now });
     return { lost: [], probes: 2 };
   }
 
   // ==========================================================================
-  // Tıkanıklık denetimi — RFC 9002 §7 (NewReno)
+  // Kayıp muhasebesi
   // ==========================================================================
-  _inCongestionRecovery(sentTime) {
-    return sentTime <= this.congestionRecoveryStartTime;
-  }
-
-  _onPacketsAcked(acked, now) {
-    for (const e of acked) {
-      if (!e.inFlight) continue;
-      // Kurtarma döneminde gönderilmiş paketler pencereyi büyütmez (§7.3.2).
-      if (this._inCongestionRecovery(e.sentTime)) continue;
-      if (this.congestionWindow < this.ssthresh) {
-        this.congestionWindow += e.bytes;                     // yavaş başlangıç
-      } else {
-        this.congestionWindow += Math.max(1,
-          Math.floor(this.maxDatagramSize * e.bytes / this.congestionWindow)); // tıkanıklıktan kaçınma
-      }
-    }
-  }
-
-  _onCongestionEvent(sentTime, now) {
-    if (this._inCongestionRecovery(sentTime)) return;   // dönem başına bir kez
-    this.stats.congestionEvents++;
-    this.congestionRecoveryStartTime = now;
-    this.ssthresh = Math.max(
-      Math.floor(this.congestionWindow * kLossReductionFactor),
-      minimumWindow(this.maxDatagramSize),
-    );
-    this.congestionWindow = this.ssthresh;
-  }
-
-  _onPacketsLost(lost, now) {
+  /** Uçuş defterini düşer, sayaçları günceller. @returns {number} kayıp bayt */
+  _accountLoss(lost) {
     this.stats.packetsLost += lost.length;
-    let largestLost = null;
+    let bytesLost = 0;
     for (const e of lost) {
       if (!e.inFlight) continue;
       this.bytesInFlight -= e.bytes;
+      bytesLost += e.bytes;
+    }
+    this.stats.bytesLost += bytesLost;
+    this.rateSampler.noteLost(bytesLost);
+    return bytesLost;
+  }
+
+  /** Denetleyiciye kaybı bildirir ve kalıcı tıkanıklığı denetler. */
+  _applyLoss(lost, ctx) {
+    let largestLost = null;
+    for (const e of lost) {
+      if (!e.inFlight) continue;
       if (!largestLost || e.sentTime > largestLost.sentTime) largestLost = e;
     }
     if (!largestLost) return;
 
-    this._onCongestionEvent(largestLost.sentTime, now);
+    this.cc.onLoss({ ...ctx, largestLost });
+    this.stats.congestionEvents = this.cc.congestionEvents || this.stats.congestionEvents;
 
     if (this._inPersistentCongestion(lost)) {
       this.stats.persistentCongestion++;
-      this.congestionWindow = minimumWindow(this.maxDatagramSize);
-      this.congestionRecoveryStartTime = 0;   // yavaş başlangıca dön
-      this.ssthresh = Infinity;
+      this.cc.onPersistentCongestion({ now: ctx.now });
+      if (this.pacer) this.pacer.reset();
     }
   }
 
   /**
    * Kalıcı tıkanıklık (§7.6): art arda kaybedilen ACK bekleyen paketler,
    * birkaç PTO süresinden uzun bir aralığı kaplıyorsa ağ gerçekten kopmuştur;
-   * pencere asgari değere düşürülür.
+   * model sıfırlanır.
    */
   _inPersistentCongestion(lost) {
     if (!this.hasRttSample) return false;
@@ -339,6 +442,7 @@ class LossRecovery {
     this.bytesInFlight = 0;
     this.lossTime = 0;
     this.ptoCount = 0;
+    if (this.pacer) this.pacer.reset();
   }
 
   snapshot() {
@@ -349,26 +453,21 @@ class LossRecovery {
       latestRtt: Math.round(this.latestRtt),
       pto: this.currentPto(),
       ptoCount: this.ptoCount,
-      congestionWindow: this.congestionWindow,
       bytesInFlight: this.bytesInFlight,
-      ssthresh: this.ssthresh === Infinity ? null : this.ssthresh,
       inFlightPackets: this.sent.size,
+      appLimited: this.rateSampler.isAppLimited,
+      deliveredBytes: this.rateSampler.delivered,
       ...this.stats,
+      ...this.cc.snapshot(),
+      ...(this.pacer ? this.pacer.snapshot() : { pacingEnabled: false }),
     };
   }
-}
-
-// RFC 9002 §7.2
-function initialWindow(maxDatagramSize) {
-  return Math.min(10 * maxDatagramSize, Math.max(14720, 2 * maxDatagramSize));
-}
-function minimumWindow(maxDatagramSize) {
-  return 2 * maxDatagramSize;
 }
 
 module.exports = {
   LossRecovery,
   kPacketThreshold, kTimeThreshold, kGranularity, kInitialRtt,
   kLossReductionFactor, kPersistentCongestionThreshold,
+  DEFAULT_CONGESTION_CONTROL,
   initialWindow, minimumWindow,
 };

@@ -10,6 +10,7 @@ const {
 } = require('./constants.js');
 const {
   DEFAULT_SUITES_13, DEFAULT_SUITES_12, resolveSuiteId, SUITES,
+  resolveCipherPolicy, cipherPolicyNames,
 } = require('./crypto/cipher-suite.js');
 const pki = require('./crypto/pki.js');
 const { normalizeRevocation, RevocationChecker } = require('./crypto/revocation.js');
@@ -124,6 +125,44 @@ function resolveSigSchemes(list) {
   });
 }
 
+/**
+ * `cipherSuites` üç biçim kabul eder ve üçü de aynı yere iner:
+ *
+ *   'chacha20'                       adlandırılmış politika (cipher-suite.js)
+ *   ['TLS_AES_128_GCM_SHA256', ...]  açık suite listesi (ad ya da sayısal ID)
+ *   [0x1301, 0x1303]                 sayısal ID listesi
+ *
+ * Tek bir dize verildiğinde önce POLİTİKA olarak aranır; eşleşmezse suite adı
+ * sayılır. Sıralama önemlidir: sunucu bu sırayı tercih sırası olarak kullanır.
+ */
+function resolveCipherSuites(value) {
+  if (value === undefined || value === null) return null;
+
+  if (typeof value === 'string') {
+    const policy = resolveCipherPolicy(value);
+    if (policy) return policy;
+    // Politika değilse tek bir suite adı olabilir.
+    try { return [resolveSuiteId(value)]; } catch {
+      throw new Error(
+        `cipherSuites: '${value}' ne bir politika ne de bilinen bir suite — `
+        + `politikalar: ${cipherPolicyNames().join(', ')}`,
+      );
+    }
+  }
+
+  if (!Array.isArray(value)) throw new TypeError('cipherSuites: dize veya dizi olmalı');
+  const out = [];
+  for (const item of value) {
+    // Dizi içinde de politika adı kabul edilir: ['chacha20', 'aes128'] gibi
+    // bir birleşim yazmak mümkün olsun.
+    const policy = typeof item === 'string' ? resolveCipherPolicy(item) : null;
+    if (policy) { out.push(...policy); continue; }
+    out.push(resolveSuiteId(item));
+  }
+  // Yinelenenler sırayı bozmadan atılır.
+  return [...new Set(out)];
+}
+
 function resolveSrtpProfiles(list) {
   if (!list) return DEFAULT_SRTP_PROFILES.slice();
   return list.map((p) => {
@@ -148,10 +187,32 @@ function normalizeSrtp(srtp) {
   };
 }
 
+/** Tıkanıklık denetleyicisi adı — takma adlar tek kanonik ada indirgenir. */
+const CONGESTION_ALIASES = Object.freeze({
+  bbr: 'bbr3', bbr3: 'bbr3', bbrv3: 'bbr3', 'bbr-v3': 'bbr3',
+  newreno: 'newreno', 'new-reno': 'newreno', reno: 'newreno', rfc9002: 'newreno',
+});
+
+function resolveCongestionControl(value) {
+  if (value === undefined || value === null || value === '') return undefined;
+  const key = String(value).toLowerCase();
+  const name = CONGESTION_ALIASES[key];
+  if (!name) {
+    throw new Error(
+      `reliable.congestionControl: bilinmeyen denetleyici '${value}' — `
+      + 'bbr3 (varsayılan) veya newreno olmalı',
+    );
+  }
+  return name;
+}
+
 /**
  * Güvenilir kanal seçenekleri. Kanal RFC 9002 (QUIC) terminolojisini kullanır
  * (RTT tahmini + PTO); eski `rto` adları geriye dönük uyumluluk için kabul
  * edilir ve karşılıklarına eşlenir.
+ *
+ * Tıkanıklık denetimi burada SEÇİLİR ama uygulanmaz: seçim bir politika, motor
+ * ise reliable/congestion.js'in işi.
  */
 function normalizeReliable(reliable, mtu) {
   if (!reliable) return null;
@@ -161,6 +222,12 @@ function normalizeReliable(reliable, mtu) {
 
   const pick = (...vals) => vals.find((v) => v !== undefined);
   return {
+    // Tıkanıklık denetimi: varsayılan BBRv3.
+    congestionControl: resolveCongestionControl(
+      pick(base.congestionControl, base.cc, base.congestion),
+    ),
+    pacing: base.pacing,
+    bbr: base.bbr,
     // DTLS kayıt ek yükü (unified header + AEAD tag + inner content type) için pay bırak.
     mtu: base.mtu ?? Math.max(256, mtu - 64),
     ordered: base.ordered === true,       // varsayılan SIRASIZ (QUIC datagram tarzı)
@@ -230,12 +297,19 @@ function normalizeOptions(role, raw = {}) {
   // --- cipher suite listeleri
   let suites13 = DEFAULT_SUITES_13.slice();
   let suites12 = DEFAULT_SUITES_12.slice();
-  if (raw.cipherSuites) {
-    const ids = raw.cipherSuites.map(resolveSuiteId);
+  // `cipher` kısa adı `cipherSuites`in eşanlamlısıdır: yapılandırma
+  // dosyalarında ve CLI'da tek kelimelik politika yazmak yaygın olan.
+  const rawSuites = raw.cipherSuites !== undefined ? raw.cipherSuites : raw.cipher;
+  const ids = resolveCipherSuites(rawSuites);
+  if (ids) {
+    if (ids.length === 0) throw new Error('cipherSuites boş olamaz');
     suites13 = ids.filter((id) => SUITES[id].tls13);
     suites12 = ids.filter((id) => !SUITES[id].tls13);
     if (allow13 && suites13.length === 0 && !allow12) {
       throw new Error('cipherSuites içinde DTLS 1.3 suite\'i yok');
+    }
+    if (allow12 && suites12.length === 0 && !allow13) {
+      throw new Error('cipherSuites içinde DTLS 1.2 suite\'i yok');
     }
   }
 
@@ -324,5 +398,5 @@ function normalizeOptions(role, raw = {}) {
 module.exports = {
   normalizeOptions, createSecureContext,
   DEFAULTS, DEFAULT_GROUPS, DEFAULT_SIG_SCHEMES, DEFAULT_SRTP_PROFILES,
-  versionList,
+  versionList, resolveCongestionControl, resolveCipherSuites,
 };

@@ -2,24 +2,79 @@
 // Yönetim konsolu.
 //
 // Çerçeve yok, derleme adımı yok, bağımlılık yok — sunucunun kendisi de öyle.
-// DOM'a yazarken her yerde `textContent` ya da kaçırılmış dize kullanılıyor:
-// bu sayfadaki verilerin çoğu (istemcinin bildirdiği ad, sertifika konusu,
-// hata mesajları) DIŞARIDAN geliyor ve `innerHTML`'e ham konsaydı, tünel
-// istemcisi olan herkes yönetim panelinde kod çalıştırabilirdi.
+//
+// TEK BİR `innerHTML` ATAMASI YOK ve bu bilinçli bir kural.
+//
+// Bu sayfadaki verilerin çoğu DIŞARIDAN geliyor: istemcinin kendi bildirdiği
+// ad, sertifika konusu, dışarıdan bağlanan bir ucun IP'si, hata mesajları.
+// Önceki sürüm bunları bir `esc()` yardımcısından geçirip dize birleştirmeyle
+// HTML üretiyordu. O yaklaşım iki nedenle terk edildi:
+//
+//   1. TEK BİR UNUTMA YETER. `esc()` çağrısı atlanmış bir yer, tünel istemcisi
+//      olan HERKESE yönetim panelinde kod çalıştırma imkânı verir. Doğruluğu
+//      "her çağrı noktasında dikkatli olmak"a bağlı bir savunma, savunma
+//      değildir.
+//   2. CSP'Yİ GERÇEK KILAR. `require-trusted-types-for 'script'` başlığı
+//      innerHTML'e yazmayı tarayıcı seviyesinde yasaklar. Ancak sayfa zaten
+//      hiç kullanmıyorsa açılabilir — ve açıldığında bu kural bir daha asla
+//      ihlal edilemez hâle gelir.
+//
+// Yerine geçen şey `el()`: düğüm ağacını doğrudan kurar, metni daima
+// `textContent` ile yazar. Metin ile biçimlendirme hiçbir noktada aynı dizede
+// buluşmaz, dolayısıyla kaçırılacak bir şey de kalmaz.
+//
+// Dinamik ölçüler (sparkline genişliği) CSS ÖZEL ÖZELLİĞİ olarak atanır:
+// CSSOM üzerinden stil yazmak CSP'nin `style-src` kapsamı dışındadır, satır içi
+// `style="..."` özniteliği ise kapsam içindedir. Aradaki fark, panelin
+// `'unsafe-inline'` olmadan çalışabilmesidir.
 
 (function () {
-  var $ = function (id) { return document.getElementById(id); };
-  var state = {
-    overview: null, tunnels: [], clients: [], apps: [], ports: null, guard: null, events: [],
-  };
+  // ======================================================================
+  // DOM yardımcıları
+  // ======================================================================
+  function $(id) { return document.getElementById(id); }
 
-  // ---------- yardımcılar ----------
-  function esc(s) {
-    var d = document.createElement('div');
-    d.textContent = s == null ? '' : String(s);
-    return d.innerHTML;
+  function append(node, children) {
+    if (children === null || children === undefined) return node;
+    var list = Array.isArray(children) ? children : [children];
+    for (var i = 0; i < list.length; i++) {
+      var c = list[i];
+      if (c === null || c === undefined || c === false) continue;
+      node.appendChild(
+        (typeof c === 'string' || typeof c === 'number')
+          ? document.createTextNode(String(c))
+          : c,
+      );
+    }
+    return node;
   }
 
+  /**
+   * @param {string} tag
+   * @param {object} [o] { class, text, id, attrs, on, props, vars }
+   * @param {*} [children] düğüm, dize ya da bunların dizisi
+   */
+  function el(tag, o, children) {
+    var node = document.createElement(tag);
+    if (o) {
+      if (o.class) node.className = o.class;
+      if (o.id) node.id = o.id;
+      // Metin DAİMA textContent ile: burada bir HTML ayrıştırıcısı yok.
+      if (o.text !== undefined && o.text !== null) node.textContent = String(o.text);
+      if (o.attrs) Object.keys(o.attrs).forEach(function (k) { node.setAttribute(k, o.attrs[k]); });
+      if (o.props) Object.keys(o.props).forEach(function (k) { node[k] = o.props[k]; });
+      if (o.on) Object.keys(o.on).forEach(function (k) { node.addEventListener(k, o.on[k]); });
+      // CSS özel özellikleri — CSSOM yolu, satır içi `style` özniteliği değil.
+      if (o.vars) Object.keys(o.vars).forEach(function (k) { node.style.setProperty(k, o.vars[k]); });
+    }
+    return append(node, children);
+  }
+
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+  function replace(node, children) { clear(node); return append(node, children); }
+
+  // ---------- biçimlendirme ----------
   function bytes(n) {
     n = Number(n) || 0;
     var units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -37,14 +92,13 @@
   }
 
   // Logaritmik: 10 kbit ile 100 Mbit aynı çubukta okunabilsin diye.
-  function sparkWidth(bytesPerSec) {
+  function sparkPercent(bytesPerSec) {
     var b = (Number(bytesPerSec) || 0) * 8;
     if (b <= 0) return 0;
-    var pct = (Math.log10(b) / Math.log10(1e9)) * 100;
-    return Math.max(2, Math.min(100, Math.round(pct)));
+    return Math.max(2, Math.min(100, Math.round((Math.log10(b) / Math.log10(1e9)) * 100)));
   }
 
-  function ms(v) { return v == null ? '—' : Math.round(v) + ' ms'; }
+  function ms(v) { return v === null || v === undefined ? '—' : Math.round(v) + ' ms'; }
 
   function date(v) { return v ? new Date(Number(v)).toLocaleString('tr-TR') : '—'; }
 
@@ -59,15 +113,140 @@
     return Math.floor(h / 24) + ' gün ' + (h % 24) + ' sa';
   }
 
-  function short(s, n) { s = String(s || ''); return s.length > (n || 16) ? s.slice(0, n || 16) + '…' : s; }
+  function short(s, n) {
+    s = String(s === null || s === undefined ? '' : s);
+    var max = n || 16;
+    return s.length > max ? s.slice(0, max) + '…' : s;
+  }
 
-  function showErr(m) { $('ok').classList.remove('show'); var e = $('err'); e.textContent = m; e.classList.add('show'); }
+  // ---------- yeniden kullanılan parçalar ----------
+  function badge(text, kind) {
+    return el('span', { class: 'badge badge-' + (kind || 'neutral'), text: text });
+  }
+
+  function mono(text, cls) {
+    return el('span', { class: cls ? 'mono ' + cls : 'mono', text: text });
+  }
+
+  function sub(text) { return el('div', { class: 'cell-sub', text: text }); }
+
+  function subMono(text) { return el('div', { class: 'cell-sub mono', text: text }); }
+
+  function strongCell(text) { return el('div', { class: 'cell-strong', text: text }); }
+
+  function statCard(label, value, note) {
+    var big = String(value).length > 9;
+    return el('div', { class: 'stat' }, [
+      el('div', { class: 'stat-label', text: label }),
+      el('div', { class: 'stat-value' + (big ? ' sm' : ''), text: value }),
+      el('div', { class: 'stat-note', text: note === undefined ? '' : note }),
+    ]);
+  }
+
+  function renderStats(hostId, rows) {
+    replace($(hostId), rows.map(function (x) { return statCard(x[0], x[1], x[2]); }));
+  }
+
+  /** Bant genişliği çubuğu. Genişlik CSS değişkeniyle veriliyor. */
+  function spark(bytesPerSec, down) {
+    return el('div', { class: down ? 'spark down' : 'spark' }, [
+      el('i', { vars: { '--spark-fill': sparkPercent(bytesPerSec) + '%' } }),
+    ]);
+  }
+
+  function btn(label, cls, onClick) {
+    return el('button', {
+      class: 'btn btn-sm' + (cls ? ' ' + cls : ''),
+      text: label,
+      attrs: { type: 'button' },
+      on: { click: onClick },
+    });
+  }
+
+  function btnRow(buttons) { return el('div', { class: 'btn-row' }, buttons); }
+
+  function td(row, content, cls) {
+    var cell = row.insertCell();
+    if (cls) cell.className = cls;
+    append(cell, content);
+    return cell;
+  }
+
+  function emptyRow(tbody, cols, text) {
+    clear(tbody);
+    var cell = tbody.insertRow().insertCell();
+    cell.colSpan = cols;
+    cell.className = 'empty';
+    cell.textContent = text;
+  }
+
+  function section(title, rows) {
+    var dl = el('dl', { class: 'kv' });
+    rows.forEach(function (r) {
+      append(dl, [el('dt', { text: r[0] }), el('dd', { text: r[1] })]);
+    });
+    return el('div', null, [el('div', { class: 'stat-label', text: title }), dl]);
+  }
+
+  // ---------- form alanları ----------
+  function labelFor(id, text) { return el('label', { attrs: { for: id }, text: text }); }
+
+  function input(id, type, value, attrs) {
+    var a = { type: type, id: id };
+    if (attrs) Object.keys(attrs).forEach(function (k) { a[k] = attrs[k]; });
+    var node = el('input', { id: id, attrs: a });
+    if (value !== undefined && value !== null) node.value = String(value);
+    return node;
+  }
+
+  function select(id, options, selected) {
+    return el('select', { id: id, attrs: { id: id } }, options.map(function (o) {
+      var opt = el('option', { text: o.label, attrs: { value: o.value } });
+      if (o.value === selected) opt.selected = true;
+      return opt;
+    }));
+  }
+
+  function checkbox(id, label, checked) {
+    var box = el('input', { id: id, attrs: { type: 'checkbox', id: id } });
+    box.checked = !!checked;
+    return el('div', { class: 'check-row' }, [box, labelFor(id, label)]);
+  }
+
+  function hint(text, cls) {
+    return el('div', { class: cls ? 'field-hint ' + cls : 'field-hint', text: text });
+  }
+
+  function fieldRow(cells) { return el('div', { class: 'field-row' }, cells); }
+
+  function field(id, label, node) { return el('div', null, [labelFor(id, label), node]); }
+
+  // ======================================================================
+  // Durum ve API
+  // ======================================================================
+  var state = {
+    overview: null, tunnels: [], clients: [], apps: [], peers: [], blocklist: [],
+  };
+
+  function showErr(m) {
+    $('ok').classList.remove('show');
+    var e = $('err');
+    e.textContent = m;
+    e.classList.add('show');
+  }
+
   function showOk(m) {
     $('err').classList.remove('show');
-    var e = $('ok'); e.textContent = m; e.classList.add('show');
+    var e = $('ok');
+    e.textContent = m;
+    e.classList.add('show');
     setTimeout(function () { e.classList.remove('show'); }, 4000);
   }
-  function clearBanners() { $('err').classList.remove('show'); $('ok').classList.remove('show'); }
+
+  function clearBanners() {
+    $('err').classList.remove('show');
+    $('ok').classList.remove('show');
+  }
 
   function api(path, opts) {
     opts = opts || {};
@@ -85,58 +264,72 @@
     });
   }
 
-  function td(row, html, cls) {
-    var cell = row.insertCell();
-    if (cls) cell.className = cls;
-    cell.innerHTML = html;
-    return cell;
-  }
+  function fail(e) { showErr(e.message); }
 
-  function emptyRow(tbody, cols, text) {
-    tbody.innerHTML = '';
-    var tr = tbody.insertRow();
-    var cell = tr.insertCell();
-    cell.colSpan = cols;
-    cell.className = 'empty';
-    cell.textContent = text;
-  }
-
-  // ---------- navigasyon ----------
+  // ======================================================================
+  // Navigasyon
+  // ======================================================================
   var LOADERS = {};
-  Array.prototype.forEach.call(document.querySelectorAll('.nav-item'), function (btn) {
-    btn.addEventListener('click', function () {
-      Array.prototype.forEach.call(document.querySelectorAll('.nav-item'), function (b) { b.classList.remove('active'); });
-      btn.classList.add('active');
-      Array.prototype.forEach.call(document.querySelectorAll('.view'), function (v) { v.classList.remove('active'); });
-      $('view-' + btn.dataset.view).classList.add('active');
+
+  function activeView() {
+    var active = document.querySelector('.nav-item.active');
+    return active ? active.dataset.view : null;
+  }
+
+  Array.prototype.forEach.call(document.querySelectorAll('.nav-item'), function (button) {
+    button.addEventListener('click', function () {
+      Array.prototype.forEach.call(document.querySelectorAll('.nav-item'), function (b) {
+        b.classList.remove('active');
+      });
+      button.classList.add('active');
+      Array.prototype.forEach.call(document.querySelectorAll('.view'), function (v) {
+        v.classList.remove('active');
+      });
+      $('view-' + button.dataset.view).classList.add('active');
       clearBanners();
-      if (LOADERS[btn.dataset.view]) LOADERS[btn.dataset.view]();
+      if (LOADERS[button.dataset.view]) LOADERS[button.dataset.view]();
     });
   });
 
-  // ---------- kip ----------
+  // ======================================================================
+  // Kip (modal)
+  // ======================================================================
   var modalSave = null;
-  function openModal(title, bodyHtml, onSave, saveLabel) {
+
+  /** @param {Node|Node[]} body — dize değil DÜĞÜM; HTML ayrıştırma yok. */
+  function openModal(title, body, onSave, saveLabel) {
     $('modal-title').textContent = title;
-    $('modal-body').innerHTML = bodyHtml;
+    replace($('modal-body'), body);
     modalSave = onSave;
     $('modal-save').textContent = saveLabel || 'Kaydet';
-    $('modal-save').style.display = onSave ? '' : 'none';
+    $('modal-save').hidden = !onSave;
     $('modal-backdrop').classList.add('open');
   }
-  function closeModal() { $('modal-backdrop').classList.remove('open'); modalSave = null; }
+
+  function closeModal() {
+    $('modal-backdrop').classList.remove('open');
+    modalSave = null;
+  }
+
   $('modal-cancel').addEventListener('click', closeModal);
-  $('modal-backdrop').addEventListener('click', function (e) { if (e.target === $('modal-backdrop')) closeModal(); });
+  $('modal-backdrop').addEventListener('click', function (e) {
+    if (e.target === $('modal-backdrop')) closeModal();
+  });
   $('modal-save').addEventListener('click', function () {
     if (!modalSave) return;
-    var btn = this;
-    btn.disabled = true;
+    var button = this;
+    button.disabled = true;
     Promise.resolve(modalSave())
       .then(closeModal)
-      .catch(function (e) { showErr(e.message); })
-      .finally(function () { btn.disabled = false; });
+      .catch(fail)
+      .finally(function () { button.disabled = false; });
   });
   document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeModal(); });
+
+  /** Onay kipi — silme/kapatma gibi geri alınamayan işlemler için. */
+  function confirmModal(title, body, action, label) {
+    openModal(title, body, action, label);
+  }
 
   // ======================================================================
   // GENEL BAKIŞ
@@ -149,200 +342,182 @@
       : 'dinlemiyor';
     $('count-tunnels').textContent = o.tunnels.online;
     $('count-apps').textContent = o.apps.total;
+    if (o.peers) $('count-peers').textContent = o.peers.active;
 
-    var s = [
+    renderStats('overview-stats', [
       ['Bağlı tünel', o.tunnels.online, o.apps.published + ' uygulama yayında'],
       ['Trafik ↓ / ↑', bits(o.traffic.rateIn) + ' / ' + bits(o.traffic.rateOut),
         bytes(o.traffic.bytesIn) + ' / ' + bytes(o.traffic.bytesOut) + ' toplam'],
-      ['Ortalama RTT', o.link.avgRttMs == null ? '—' : o.link.avgRttMs + ' ms', 'RFC 9002 yumuşatılmış'],
+      ['Ortalama RTT', o.link.avgRttMs === null ? '—' : o.link.avgRttMs + ' ms',
+        o.link.congestionControl ? o.link.congestionControl + ' · yumuşatılmış' : 'RFC 9002 yumuşatılmış'],
       ['Açık akış', o.streams, 'mantıksal bağlantı'],
-      ['Port havuzu', o.ports.free + ' boş', o.ports.active + ' kullanımda · ' + o.ports.linger + ' beklemede'],
+      ['Ziyaretçi', o.peers ? o.peers.active : '—',
+        o.peers ? (o.peers.total + ' toplam · ' + o.peers.blocked + ' engelli') : 'genel yüzey'],
+      ['Port havuzu', o.ports.free + ' boş',
+        o.ports.active + ' kullanımda · ' + o.ports.linger + ' beklemede'],
       ['Reddedilen', o.guard.refused, o.guard.bannedIps + ' yasaklı kaynak'],
       ['Çalışma süresi', duration(o.uptimeMs), 'kalıcılık: ' + o.persistence],
-      ['El sıkışma hatası', o.tunnels.handshakeFailures, o.tunnels.accepted + ' kabul edildi'],
-    ];
-    $('overview-stats').innerHTML = s.map(function (x) {
-      var big = String(x[1]).length > 9;
-      return '<div class="stat"><div class="stat-label">' + esc(x[0]) + '</div>'
-        + '<div class="stat-value' + (big ? ' sm' : '') + '">' + esc(x[1]) + '</div>'
-        + '<div class="stat-note">' + esc(x[2]) + '</div></div>';
-    }).join('');
+    ]);
+  }
+
+  function tunnelHealthBadge(t) {
+    if (t.state !== 'ready') return badge(t.state, 'warn');
+    if (t.revocation && !t.revocation.ok) return badge('iptal denetimi', 'bad');
+    if (t.link.lossRate > 0.05) return badge('kayıp %' + (t.link.lossRate * 100).toFixed(1), 'warn');
+    return badge('sağlıklı', 'ok');
   }
 
   function renderOverviewTunnels() {
     var tb = $('overview-tunnels');
     if (!state.tunnels.length) { emptyRow(tb, 7, 'Bağlı tünel yok.'); return; }
-    tb.innerHTML = '';
+    clear(tb);
     state.tunnels.forEach(function (t) {
       var tr = tb.insertRow();
-      td(tr, '<div class="cell-strong">' + esc(t.name) + '</div>'
-        + '<div class="cell-sub mono">' + esc(short(t.clientId, 20)) + '</div>');
-      td(tr, '<span class="mono">' + esc(t.remoteAddress) + ':' + esc(t.remotePort) + '</span>'
-        + '<div class="cell-sub">' + esc(t.transport.protocol || '—') + '</div>');
-      td(tr, ms(t.link.rttMs) + '<div class="cell-sub">min ' + ms(t.link.minRttMs) + '</div>', 'num');
-      td(tr, '↓ ' + bits(t.traffic.rateIn) + '<div class="spark down"><i style="width:' + sparkWidth(t.traffic.rateIn) + '%"></i></div>'
-        + '↑ ' + bits(t.traffic.rateOut) + '<div class="spark"><i style="width:' + sparkWidth(t.traffic.rateOut) + '%"></i></div>', 'num');
-      td(tr, bytes(t.traffic.bytesIn + t.traffic.bytesOut)
-        + '<div class="cell-sub">' + t.streams.open + ' akış</div>', 'num');
+      td(tr, [strongCell(t.name), subMono(short(t.clientId, 20))]);
+      td(tr, [mono(t.remoteAddress + ':' + t.remotePort), sub(t.transport.protocol || '—')]);
+      td(tr, [ms(t.link.rttMs), sub('min ' + ms(t.link.minRttMs))], 'num');
+      td(tr, [
+        '↓ ' + bits(t.traffic.rateIn), spark(t.traffic.rateIn, true),
+        '↑ ' + bits(t.traffic.rateOut), spark(t.traffic.rateOut, false),
+      ], 'num');
+      td(tr, [bytes(t.traffic.bytesIn + t.traffic.bytesOut), sub(t.streams.open + ' akış')], 'num');
       td(tr, String(t.apps.length), 'num');
       td(tr, tunnelHealthBadge(t));
     });
   }
 
-  function tunnelHealthBadge(t) {
-    if (t.state !== 'ready') return '<span class="badge badge-warn">' + esc(t.state) + '</span>';
-    if (t.revocation && !t.revocation.ok) return '<span class="badge badge-bad">iptal denetimi</span>';
-    if (t.link.lossRate > 0.05) return '<span class="badge badge-warn">kayıp %' + (t.link.lossRate * 100).toFixed(1) + '</span>';
-    return '<span class="badge badge-ok">sağlıklı</span>';
-  }
-
   LOADERS.overview = function () {
-    return Promise.all([api('/api/overview'), api('/api/tunnels')]).then(function (r) {
-      renderOverview(r[0]);
-      state.tunnels = r[1].tunnels;
+    return Promise.all([api('/api/overview'), api('/api/tunnels')]).then(function (res) {
+      renderOverview(res[0]);
+      state.tunnels = res[1].tunnels;
       renderOverviewTunnels();
-      $('whoami').innerHTML = 'Oturum: <strong>' + esc(r[0].me.username) + '</strong>';
-    }).catch(function (e) { showErr(e.message); });
+      replace($('whoami'), ['Oturum: ', el('strong', { text: res[0].me.username })]);
+    }).catch(fail);
   };
 
   // ======================================================================
   // TÜNELLER
   // ======================================================================
-  LOADERS.tunnels = function () {
-    return api('/api/tunnels').then(function (r) {
-      state.tunnels = r.tunnels;
-      var host = $('tunnel-cards');
-      host.innerHTML = '';
-      if (!r.tunnels.length) {
-        host.innerHTML = '<div class="table-wrap"><div class="empty">Bağlı tünel yok.</div></div>';
-        return;
-      }
-      r.tunnels.forEach(function (t) { host.appendChild(tunnelCard(t)); });
-    }).catch(function (e) { showErr(e.message); });
-  };
-
   function tunnelCard(t) {
-    var wrap = document.createElement('div');
-    wrap.className = 'table-wrap';
+    var wrap = el('div', { class: 'table-wrap' });
 
-    var head = document.createElement('div');
-    head.className = 'table-head';
-    head.innerHTML = '<h2>' + esc(t.name) + ' <span class="badge badge-neutral">' + esc(t.transport.protocol || '') + '</span> '
-      + tunnelHealthBadge(t) + '</h2>';
-    var actions = document.createElement('div');
-    actions.className = 'btn-row';
-
-    var limitBtn = document.createElement('button');
-    limitBtn.className = 'btn btn-sm';
-    limitBtn.textContent = 'Bant sınırı';
-    limitBtn.addEventListener('click', function () { openTunnelLimitModal(t); });
-    actions.appendChild(limitBtn);
-
-    var appBtn = document.createElement('button');
-    appBtn.className = 'btn btn-sm';
-    appBtn.textContent = 'Uygulama ekle';
-    appBtn.addEventListener('click', function () { openAppModal(null, t.clientId); });
-    actions.appendChild(appBtn);
-
-    var kick = document.createElement('button');
-    kick.className = 'btn btn-sm btn-danger';
-    kick.textContent = 'Bağlantıyı kes';
-    kick.addEventListener('click', function () {
-      openModal('Tüneli kapat', '<p>“' + esc(t.name) + '” tüneli kapatılacak. '
-        + 'Yayındaki <strong>' + t.apps.length + ' uygulama</strong> anında erişilemez olur; '
-        + 'portlar kısa bir süre bu istemci için ayrılmış kalır.</p>', function () {
-        return api('/api/tunnels/' + encodeURIComponent(t.tunnelId) + '/disconnect', { method: 'POST', body: {} })
-          .then(function () { showOk('Tünel kapatıldı.'); return LOADERS.tunnels(); });
-      }, 'Kapat');
-    });
-    actions.appendChild(kick);
-    head.appendChild(actions);
-    wrap.appendChild(head);
-
-    var body = document.createElement('div');
-    body.style.padding = '16px';
-    body.style.display = 'grid';
-    body.style.gridTemplateColumns = 'repeat(auto-fit, minmax(260px, 1fr))';
-    body.style.gap = '18px';
+    var head = el('div', { class: 'table-head' }, [
+      el('h2', null, [
+        t.name, ' ',
+        badge(t.transport.protocol || '—', 'neutral'), ' ',
+        tunnelHealthBadge(t),
+      ]),
+      btnRow([
+        btn('Bant sınırı', null, function () { openTunnelLimitModal(t); }),
+        btn('Uygulama ekle', null, function () { openAppModal(null, t.clientId); }),
+        btn('Bağlantıyı kes', 'btn-danger', function () {
+          confirmModal('Tüneli kapat', [
+            el('p', null, [
+              '“' + t.name + '” tüneli kapatılacak. Yayındaki ',
+              el('strong', { text: t.apps.length + ' uygulama' }),
+              ' anında erişilemez olur; portlar kısa bir süre bu istemci için ayrılmış kalır.',
+            ]),
+          ], function () {
+            return api('/api/tunnels/' + encodeURIComponent(t.tunnelId) + '/disconnect', {
+              method: 'POST', body: {},
+            }).then(function () { showOk('Tünel kapatıldı.'); return LOADERS.tunnels(); });
+          }, 'Kapat');
+        }),
+      ]),
+    ]);
+    append(wrap, head);
 
     var cert = t.certificate || {};
     var rev = t.revocation;
-    body.innerHTML = ''
-      + section('Bağlantı', [
+    var link = t.link;
+    append(wrap, el('div', { class: 'card-body' }, [
+      section('Bağlantı', [
         ['Adres', t.remoteAddress + ':' + t.remotePort],
         ['Şifre', t.transport.cipher || '—'],
         ['Çalışma süresi', duration(t.uptimeMs)],
         ['Tünel kimliği', t.tunnelId],
-      ])
-      + section('Bağlantı kalitesi', [
-        ['RTT (ağ)', ms(t.link.rttMs) + ' · min ' + ms(t.link.minRttMs)],
-        ['RTT (uygulama)', ms(t.link.appRttMs)],
-        ['Tıkanıklık penceresi', bytes(t.link.congestionWindow) + ' · uçuşta ' + bytes(t.link.bytesInFlight)],
-        ['Kayıp', (t.link.lossRate * 100).toFixed(3) + '% · ' + t.link.retransmits + ' yeniden gönderim'],
-        ['Tıkanıklık olayı', String(t.link.congestionEvents)],
-      ])
-      + section('Trafik', [
+      ]),
+      section('Bağlantı kalitesi', [
+        ['Tıkanıklık denetimi', link.congestionControl || '—'],
+        ['RTT (ağ)', ms(link.rttMs) + ' · min ' + ms(link.minRttMs)],
+        ['RTT (uygulama)', ms(link.appRttMs)],
+        ['Tahmini bant genişliği', link.bandwidthBps ? bits(link.bandwidthBps) : '—'],
+        ['Hedef gönderim hızı', link.pacingRateBps ? bits(link.pacingRateBps) : 'şekillendirme yok'],
+        ['Tıkanıklık penceresi', bytes(link.congestionWindow) + ' · uçuşta ' + bytes(link.bytesInFlight)],
+        ['Model durumu', link.ccState || '—'],
+        ['Kayıp', (link.lossRate * 100).toFixed(3) + '% · ' + link.retransmits + ' yeniden gönderim'],
+      ]),
+      section('Trafik', [
         ['Anlık', '↓ ' + bits(t.traffic.rateIn) + ' / ↑ ' + bits(t.traffic.rateOut)],
         ['Toplam', bytes(t.traffic.bytesIn) + ' / ' + bytes(t.traffic.bytesOut)],
         ['Çıkış sınırı', t.traffic.egressLimitBps ? bits(t.traffic.egressLimitBps) : 'sınırsız'],
         ['Akışlar', t.streams.open + ' açık · ' + t.streams.opened + ' toplam · ' + t.streams.resets + ' reset'],
         ['Datagram', t.datagrams.in + ' ↓ / ' + t.datagrams.out + ' ↑ · ' + t.datagrams.dropped + ' düşen'],
-      ])
-      + section('Sertifika', [
+      ]),
+      section('Sertifika', [
         ['Konu', cert.commonName || '—'],
         ['Veren', cert.issuer || '—'],
         ['Seri', cert.serialNumber || '—'],
         ['Geçerlilik', (cert.validFrom || '—') + ' → ' + (cert.validTo || '—')],
         ['Parmak izi', short(cert.fingerprint256, 32)],
         ['İptal denetimi', rev ? (rev.ok ? 'geçerli' : ('BAŞARISIZ: ' + rev.error)) : 'kapalı'],
-      ]);
-
-    wrap.appendChild(body);
+      ]),
+    ]));
 
     if (t.apps.length) {
-      var tableWrap = document.createElement('div');
-      tableWrap.className = 'table-scroll';
-      tableWrap.style.borderTop = '1px solid var(--line)';
-      var table = document.createElement('table');
-      table.innerHTML = '<thead><tr><th>Uygulama</th><th>Yerel</th><th>Genel</th><th>Bağlantı</th><th>Trafik</th><th>Durum</th></tr></thead>';
-      var tb = document.createElement('tbody');
+      var tbody = el('tbody');
       t.apps.forEach(function (a) {
-        var tr = tb.insertRow();
-        td(tr, '<div class="cell-strong">' + esc(a.name) + '</div><div class="cell-sub">' + esc(a.protocol) + ' · ' + esc(a.delivery) + '</div>');
-        td(tr, '<span class="mono">' + esc(a.local) + '</span>');
-        td(tr, a.publicPort ? '<span class="chip">' + esc(a.publicHost || '') + ':' + a.publicPort + '</span>' : '<span class="badge badge-warn">bağlı değil</span>');
+        var tr = tbody.insertRow();
+        td(tr, [strongCell(a.name), sub(a.protocol + ' · ' + a.delivery)]);
+        td(tr, mono(a.local));
+        td(tr, a.publicPort
+          ? el('span', { class: 'chip', text: (a.publicHost || '') + ':' + a.publicPort })
+          : badge('bağlı değil', 'warn'));
         td(tr, a.live ? (a.live.activeConnections + ' / ' + a.live.totalConnections) : '—', 'num');
         td(tr, a.live ? (bytes(a.live.bytesIn) + ' ↓ / ' + bytes(a.live.bytesOut) + ' ↑') : '—', 'num');
-        td(tr, a.enabled ? '<span class="badge badge-ok">açık</span>' : '<span class="badge badge-neutral">kapalı</span>');
+        td(tr, a.enabled ? badge('açık', 'ok') : badge('kapalı', 'neutral'));
       });
-      table.appendChild(tb);
-      tableWrap.appendChild(table);
-      wrap.appendChild(tableWrap);
+
+      append(wrap, el('div', { class: 'table-scroll card-table' }, [
+        el('table', null, [
+          el('thead', null, [
+            el('tr', null, ['Uygulama', 'Yerel', 'Genel', 'Bağlantı', 'Trafik', 'Durum']
+              .map(function (h) { return el('th', { text: h }); })),
+          ]),
+          tbody,
+        ]),
+      ]));
     }
     return wrap;
   }
 
-  function section(title, rows) {
-    return '<div><div class="stat-label">' + esc(title) + '</div><dl class="kv">'
-      + rows.map(function (r) {
-        return '<dt>' + esc(r[0]) + '</dt><dd>' + esc(r[1]) + '</dd>';
-      }).join('')
-      + '</dl></div>';
-  }
-
   function openTunnelLimitModal(t) {
     var current = t.traffic.egressLimitBps ? (t.traffic.egressLimitBps * 8 / 1e6) : 0;
-    openModal('Bant sınırı — ' + t.name,
-      '<p class="field-hint" style="margin-top:0">Tünelin TOPLAM çıkış hızı (sunucudan istemciye). '
-      + '0 = sınırsız. Sınır, uygulama başına verilen sınırların üstünde bir tavandır.</p>'
-      + '<label for="egress">Çıkış (Mbit/s)</label>'
-      + '<input type="number" id="egress" min="0" step="0.1" value="' + current + '">',
-      function () {
-        return api('/api/tunnels/' + encodeURIComponent(t.tunnelId) + '/limits', {
-          method: 'POST', body: { egressMbit: Number($('egress').value) || 0 },
-        }).then(function () { showOk('Sınır uygulandı.'); return LOADERS.tunnels(); });
-      });
+    openModal('Bant sınırı — ' + t.name, [
+      hint('Tünelin TOPLAM çıkış hızı (sunucudan istemciye). 0 = sınırsız. '
+           + 'Sınır, uygulama başına verilen sınırların üstünde bir tavandır.', 'modal-hint-top'),
+      labelFor('egress', 'Çıkış (Mbit/s)'),
+      input('egress', 'number', current, { min: '0', step: '0.1' }),
+    ], function () {
+      return api('/api/tunnels/' + encodeURIComponent(t.tunnelId) + '/limits', {
+        method: 'POST', body: { egressMbit: Number($('egress').value) || 0 },
+      }).then(function () { showOk('Sınır uygulandı.'); return LOADERS.tunnels(); });
+    });
   }
+
+  LOADERS.tunnels = function () {
+    return api('/api/tunnels').then(function (res) {
+      state.tunnels = res.tunnels;
+      var host = $('tunnel-cards');
+      if (!res.tunnels.length) {
+        replace(host, el('div', { class: 'table-wrap' }, [
+          el('div', { class: 'empty', text: 'Bağlı tünel yok.' }),
+        ]));
+        return;
+      }
+      replace(host, res.tunnels.map(tunnelCard));
+    }).catch(fail);
+  };
 
   // ======================================================================
   // İSTEMCİLER
@@ -350,166 +525,293 @@
   function renderClients() {
     var q = ($('client-filter').value || '').toLowerCase();
     var rows = state.clients.filter(function (c) {
-      return !q || [c.commonName, c.displayName, c.email, c.clientId]
-        .some(function (v) { return String(v || '').toLowerCase().indexOf(q) >= 0; });
+      return !q || [c.commonName, c.displayName, c.email, c.clientId].some(function (v) {
+        return String(v || '').toLowerCase().indexOf(q) >= 0;
+      });
     });
     $('count-clients').textContent = state.clients.length;
+
     var tb = $('clients-body');
     if (!rows.length) { emptyRow(tb, 5, 'Kayıtlı istemci yok.'); return; }
-    tb.innerHTML = '';
+    clear(tb);
     rows.forEach(function (c) {
       var tr = tb.insertRow();
-      td(tr, '<div class="cell-strong">' + esc(c.displayName || c.commonName || '—') + '</div>'
-        + '<div class="cell-sub">' + esc(c.email || '') + '</div>'
-        + '<div class="cell-sub mono">' + esc(short(c.clientId, 24)) + '</div>');
-      td(tr, '<div class="cell-sub mono">' + esc(c.certSerial || '—') + '</div>'
-        + '<div class="cell-sub">bitiş: ' + date(c.certNotAfter) + '</div>');
-      td(tr, date(c.lastSeenAt) + '<div class="cell-sub mono">' + esc(c.lastAddress || '') + '</div>');
+      td(tr, [
+        strongCell(c.displayName || c.commonName || '—'),
+        sub(c.email || ''),
+        subMono(short(c.clientId, 24)),
+      ]);
+      td(tr, [subMono(c.certSerial || '—'), sub('bitiş: ' + date(c.certNotAfter))]);
+      td(tr, [date(c.lastSeenAt), subMono(c.lastAddress || '')]);
       td(tr, c.blocked
-        ? '<span class="badge badge-bad">engelli</span>'
-        : (c.online ? '<span class="badge badge-ok">çevrimiçi</span>' : '<span class="badge badge-neutral">çevrimdışı</span>'));
-
-      var cell = tr.insertCell();
-      var row = document.createElement('div');
-      row.className = 'btn-row';
-
-      var addApp = document.createElement('button');
-      addApp.className = 'btn btn-sm';
-      addApp.textContent = 'Uygulama ekle';
-      addApp.addEventListener('click', function () { openAppModal(null, c.clientId); });
-      row.appendChild(addApp);
-
-      var block = document.createElement('button');
-      block.className = 'btn btn-sm' + (c.blocked ? '' : ' btn-danger');
-      block.textContent = c.blocked ? 'Engeli kaldır' : 'Engelle';
-      block.addEventListener('click', function () {
-        api('/api/clients/' + encodeURIComponent(c.clientId) + '/block', {
-          method: 'POST', body: { blocked: !c.blocked },
-        }).then(function () { showOk(c.blocked ? 'Engel kaldırıldı.' : 'İstemci engellendi.'); return LOADERS.clients(); })
-          .catch(function (e) { showErr(e.message); });
-      });
-      row.appendChild(block);
-      cell.appendChild(row);
+        ? badge('engelli', 'bad')
+        : (c.online ? badge('çevrimiçi', 'ok') : badge('çevrimdışı', 'neutral')));
+      td(tr, btnRow([
+        btn('Uygulama ekle', null, function () { openAppModal(null, c.clientId); }),
+        btn(c.blocked ? 'Engeli kaldır' : 'Engelle', c.blocked ? null : 'btn-danger', function () {
+          api('/api/clients/' + encodeURIComponent(c.clientId) + '/block', {
+            method: 'POST', body: { blocked: !c.blocked },
+          }).then(function () {
+            showOk(c.blocked ? 'Engel kaldırıldı.' : 'İstemci engellendi.');
+            return LOADERS.clients();
+          }).catch(fail);
+        }),
+      ]));
     });
   }
+
   $('client-filter').addEventListener('input', renderClients);
 
   LOADERS.clients = function () {
-    return api('/api/clients').then(function (r) { state.clients = r.clients; renderClients(); })
-      .catch(function (e) { showErr(e.message); });
+    return api('/api/clients').then(function (res) {
+      state.clients = res.clients;
+      renderClients();
+    }).catch(fail);
+  };
+
+  // ======================================================================
+  // ZİYARETÇİLER — genel yüzeye dışarıdan bağlananlar
+  // ======================================================================
+  /**
+   * Gecikme PASİF ölçümdür (bkz. server/peers.js): son yazdığımız bayt ile
+   * uçtan gelen bir sonraki bayt arasındaki en küçük fark. Kullanıcıya bunun
+   * bir "ping" olmadığı, ölçüm yöntemi rozetle söyleniyor.
+   */
+  function rttCell(p) {
+    if (p.rttMs === null || p.rttMs === undefined) {
+      return el('span', { class: 'rtt rtt-unknown', text: '—' });
+    }
+    var cls = p.rttMs < 60 ? 'rtt-good' : (p.rttMs < 150 ? 'rtt-fair' : 'rtt-poor');
+    return el('span', { class: 'rtt ' + cls, text: Math.round(p.rttMs) + ' ms' });
+  }
+
+  function renderPeers() {
+    var q = ($('peer-filter').value || '').toLowerCase();
+    var rows = state.peers.filter(function (p) {
+      return !q || [p.address, String(p.port), p.appName, String(p.publicPort)].some(function (v) {
+        return String(v || '').toLowerCase().indexOf(q) >= 0;
+      });
+    });
+    $('count-peers').textContent = state.peers.length;
+
+    var tb = $('peers-body');
+    if (!rows.length) { emptyRow(tb, 7, 'Açık bağlantı yok.'); return; }
+    clear(tb);
+    rows.forEach(function (p) {
+      var tr = tb.insertRow();
+      td(tr, [mono(p.address), sub('kaynak port ' + p.port)]);
+      td(tr, [strongCell(p.appName || '—'), sub(p.protocol + ' · ' + (p.tunnelName || '—'))]);
+      td(tr, mono(String(p.publicPort || '—')), 'num');
+      td(tr, [rttCell(p), sub(p.samples ? p.samples + ' ölçüm' : 'ölçülmedi')], 'num');
+      td(tr, duration(p.uptimeMs), 'num');
+      td(tr, [
+        bytes(p.bytesIn + p.bytesOut),
+        sub('↓ ' + bytes(p.bytesIn) + ' / ↑ ' + bytes(p.bytesOut)),
+      ], 'num');
+      td(tr, btnRow([
+        btn('At', null, function () {
+          api('/api/peers/' + encodeURIComponent(p.id) + '/kick', { method: 'POST', body: {} })
+            .then(function () { showOk('Bağlantı kapatıldı.'); return LOADERS.peers(); })
+            .catch(fail);
+        }),
+        btn('Engelle', 'btn-danger', function () { openBlockModal(p.address); }),
+      ]));
+    });
+  }
+
+  function renderBlocklist() {
+    var tb = $('blocklist-body');
+    if (!state.blocklist.length) { emptyRow(tb, 5, 'Engelli adres yok.'); return; }
+    clear(tb);
+    state.blocklist.forEach(function (b) {
+      var tr = tb.insertRow();
+      td(tr, mono(b.address));
+      td(tr, b.reason || '—');
+      td(tr, sub(b.actor || '—'));
+      td(tr, b.expiresAt ? duration(b.expiresAt - Date.now()) : badge('kalıcı', 'dark'), 'num');
+      td(tr, btn('Kaldır', null, function () {
+        api('/api/blocklist/' + encodeURIComponent(b.address), { method: 'DELETE' })
+          .then(function () { showOk('Engel kaldırıldı.'); return LOADERS.peers(); })
+          .catch(fail);
+      }));
+    });
+  }
+
+  function openBlockModal(address) {
+    openModal('Adresi engelle', [
+      hint('Engellenen adres genel portlara BAĞLANAMAZ ve o adrese ait açık '
+           + 'bağlantılar hemen kapatılır. Süre boş bırakılırsa engel kalıcıdır.',
+           'modal-hint-top'),
+      labelFor('blk-addr', 'IP adresi'),
+      input('blk-addr', 'text', address || '', { placeholder: '203.0.113.10' }),
+      fieldRow([
+        field('blk-ttl', 'Süre (dakika, 0 = kalıcı)', input('blk-ttl', 'number', 0, { min: '0' })),
+        field('blk-reason', 'Sebep', input('blk-reason', 'text', '', { maxlength: '120' })),
+      ]),
+    ], function () {
+      var addr = $('blk-addr').value.trim();
+      if (!addr) return Promise.reject(new Error('IP adresi gerekli'));
+      var minutes = Number($('blk-ttl').value) || 0;
+      return api('/api/blocklist', {
+        method: 'POST',
+        body: {
+          address: addr,
+          ttlMs: minutes > 0 ? minutes * 60_000 : 0,
+          reason: $('blk-reason').value.trim(),
+        },
+      }).then(function () { showOk('Adres engellendi.'); return LOADERS.peers(); });
+    }, 'Engelle');
+  }
+
+  $('peer-filter').addEventListener('input', renderPeers);
+  $('btn-peers-refresh').addEventListener('click', function () {
+    clearBanners();
+    LOADERS.peers().then(function () { showOk('Yenilendi.'); });
+  });
+  $('btn-block-add').addEventListener('click', function () { openBlockModal(''); });
+
+  LOADERS.peers = function () {
+    return Promise.all([api('/api/peers'), api('/api/blocklist')]).then(function (res) {
+      state.peers = res[0].peers;
+      state.blocklist = res[1].blocklist;
+      var s = res[0].stats;
+      renderStats('peer-stats', [
+        ['Açık bağlantı', s.active, s.distinctAddresses + ' farklı adres'],
+        ['Toplam', s.total, s.kicked + ' atıldı'],
+        ['Ortalama gecikme', s.avgRttMs === null ? '—' : s.avgRttMs + ' ms', 'pasif ölçüm'],
+        ['Engelli adres', state.blocklist.length, s.blockedRejections + ' istek reddedildi'],
+      ]);
+      renderPeers();
+      renderBlocklist();
+    }).catch(fail);
   };
 
   // ======================================================================
   // UYGULAMALAR
   // ======================================================================
+  function appStatusBadge(a) {
+    if (!a.enabled) return badge('kapalı', 'neutral');
+    if (a.live && a.live.bound) return badge('yayında', 'ok');
+    return a.lastError ? badge('hata', 'bad') : badge('çevrimdışı', 'warn');
+  }
+
   function renderApps() {
     var q = ($('app-filter').value || '').toLowerCase();
     var rows = state.apps.filter(function (a) {
-      return !q || [a.name, a.local, String(a.publicPort), a.clientId]
-        .some(function (v) { return String(v || '').toLowerCase().indexOf(q) >= 0; });
+      return !q || [a.name, a.local, String(a.publicPort), a.clientId].some(function (v) {
+        return String(v || '').toLowerCase().indexOf(q) >= 0;
+      });
     });
     $('count-apps').textContent = state.apps.length;
+
     var tb = $('apps-body');
     if (!rows.length) { emptyRow(tb, 8, 'Tanımlı uygulama yok.'); return; }
-    tb.innerHTML = '';
+    clear(tb);
     rows.forEach(function (a) {
       var tr = tb.insertRow();
-      td(tr, '<div class="cell-strong">' + esc(a.name) + '</div>'
-        + '<div class="cell-sub">' + esc(a.protocol) + (a.sticky ? ' · sabit port' : '') + '</div>'
-        + '<div class="cell-sub mono">' + esc(short(a.clientId, 18)) + '</div>');
-      td(tr, '<span class="mono">' + esc(a.local) + '</span>');
+      td(tr, [
+        strongCell(a.name),
+        sub(a.protocol + (a.sticky ? ' · sabit port' : '')),
+        subMono(short(a.clientId, 18)),
+      ]);
+      td(tr, mono(a.local));
       td(tr, a.publicPort
-        ? '<span class="chip">' + esc(a.publicHost || '') + ':' + a.publicPort + '</span>'
+        ? el('span', { class: 'chip', text: (a.publicHost || '') + ':' + a.publicPort })
         : (a.requestedPublicPort
-          ? '<span class="badge badge-warn">istenen ' + a.requestedPublicPort + '</span>'
-          : '<span class="badge badge-neutral">otomatik</span>'));
-      td(tr, '<span class="badge badge-neutral">' + esc(a.delivery) + '</span>');
-      td(tr, (a.rateInBps ? bits(a.rateInBps) : '∞') + ' ↑<div class="cell-sub">'
-        + (a.rateOutBps ? bits(a.rateOutBps) : '∞') + ' ↓</div>', 'num');
+          ? badge('istenen ' + a.requestedPublicPort, 'warn')
+          : badge('otomatik', 'neutral')));
+      td(tr, badge(a.delivery, 'neutral'));
+      td(tr, [
+        (a.rateInBps ? bits(a.rateInBps) : '∞') + ' ↑',
+        sub((a.rateOutBps ? bits(a.rateOutBps) : '∞') + ' ↓'),
+      ], 'num');
       td(tr, a.live
-        ? (bytes(a.live.bytesIn + a.live.bytesOut) + '<div class="cell-sub">' + a.live.activeConnections + ' bağlantı</div>')
+        ? [bytes(a.live.bytesIn + a.live.bytesOut), sub(a.live.activeConnections + ' bağlantı')]
         : '—', 'num');
-      td(tr, !a.enabled ? '<span class="badge badge-neutral">kapalı</span>'
-        : (a.live && a.live.bound ? '<span class="badge badge-ok">yayında</span>'
-          : (a.lastError ? '<span class="badge badge-bad">hata</span>' : '<span class="badge badge-warn">çevrimdışı</span>')));
-
-      var cell = tr.insertCell();
-      var row = document.createElement('div');
-      row.className = 'btn-row';
-
-      var edit = document.createElement('button');
-      edit.className = 'btn btn-sm';
-      edit.textContent = 'Düzenle';
-      edit.addEventListener('click', function () { openAppModal(a, a.clientId); });
-      row.appendChild(edit);
-
-      var toggle = document.createElement('button');
-      toggle.className = 'btn btn-sm';
-      toggle.textContent = a.enabled ? 'Kapat' : 'Aç';
-      toggle.addEventListener('click', function () {
-        api('/api/apps/' + encodeURIComponent(a.appId), { method: 'PATCH', body: { enabled: !a.enabled } })
-          .then(function () { showOk('Uygulama güncellendi.'); return LOADERS.apps(); })
-          .catch(function (e) { showErr(e.message); });
-      });
-      row.appendChild(toggle);
-
-      var del = document.createElement('button');
-      del.className = 'btn btn-sm btn-danger';
-      del.textContent = 'Sil';
-      del.addEventListener('click', function () {
-        openModal('Uygulamayı sil', '<p>“' + esc(a.name) + '” silinecek. '
-          + 'Genel port <strong>anında serbest bırakılır</strong> ve başka bir uygulamaya verilebilir.</p>', function () {
-          return api('/api/apps/' + encodeURIComponent(a.appId), { method: 'DELETE' })
-            .then(function () { showOk('Uygulama silindi.'); return LOADERS.apps(); });
-        }, 'Sil');
-      });
-      row.appendChild(del);
-      cell.appendChild(row);
+      td(tr, appStatusBadge(a));
+      td(tr, btnRow([
+        btn('Düzenle', null, function () { openAppModal(a, a.clientId); }),
+        btn(a.enabled ? 'Kapat' : 'Aç', null, function () {
+          api('/api/apps/' + encodeURIComponent(a.appId), {
+            method: 'PATCH', body: { enabled: !a.enabled },
+          }).then(function () { showOk('Uygulama güncellendi.'); return LOADERS.apps(); })
+            .catch(fail);
+        }),
+        btn('Sil', 'btn-danger', function () {
+          confirmModal('Uygulamayı sil', [
+            el('p', null, [
+              '“' + a.name + '” silinecek. Genel port ',
+              el('strong', { text: 'anında serbest bırakılır' }),
+              ' ve başka bir uygulamaya verilebilir.',
+            ]),
+          ], function () {
+            return api('/api/apps/' + encodeURIComponent(a.appId), { method: 'DELETE' })
+              .then(function () { showOk('Uygulama silindi.'); return LOADERS.apps(); });
+          }, 'Sil');
+        }),
+      ]));
     });
   }
+
   $('app-filter').addEventListener('input', renderApps);
 
   function openAppModal(existing, clientId) {
     var e = existing || {};
     var isEdit = !!existing;
+    var target = e.clientId || clientId;
+
     var clientOptions = state.clients.map(function (c) {
-      var sel = (c.clientId === (e.clientId || clientId)) ? ' selected' : '';
-      return '<option value="' + esc(c.clientId) + '"' + sel + '>'
-        + esc((c.displayName || c.commonName || short(c.clientId, 16)) + (c.online ? ' (çevrimiçi)' : ''))
-        + '</option>';
-    }).join('');
+      return {
+        value: c.clientId,
+        label: (c.displayName || c.commonName || short(c.clientId, 16)) + (c.online ? ' (çevrimiçi)' : ''),
+      };
+    });
 
-    var html = ''
-      + (isEdit ? '' : '<label for="f-client">İstemci</label><select id="f-client">' + clientOptions + '</select>')
-      + '<label for="f-name">Ad</label><input type="text" id="f-name" value="' + esc(e.name || '') + '" placeholder="web">'
-      + '<div class="field-row">'
-      + '<div><label for="f-host">Yerel adres</label><input type="text" id="f-host" value="' + esc(e.localHost || '127.0.0.2') + '" placeholder="127.0.0.2"></div>'
-      + '<div><label for="f-port">Yerel port</label><input type="number" id="f-port" min="1" max="65535" value="' + esc(e.localPort || '') + '" placeholder="8080"></div>'
-      + '</div>'
-      + '<div class="field-hint">İstemcinin KENDİ ağında bağlanacağı adres. Örn. 127.0.0.2:8080 ya da 127.0.0.9:5432.</div>'
-      + '<div class="field-row">'
-      + '<div><label for="f-proto">Protokol</label><select id="f-proto">'
-      + '<option value="tcp"' + (e.protocol === 'udp' ? '' : ' selected') + '>TCP</option>'
-      + '<option value="udp"' + (e.protocol === 'udp' ? ' selected' : '') + '>UDP</option></select></div>'
-      + '<div><label for="f-delivery">Teslim</label><select id="f-delivery">'
-      + '<option value="reliable"' + (e.delivery === 'unreliable' ? '' : ' selected') + '>Kayıpsız</option>'
-      + '<option value="unreliable"' + (e.delivery === 'unreliable' ? ' selected' : '') + '>Kayıp toleranslı</option></select></div>'
-      + '</div>'
-      + '<div class="field-hint">TCP her zaman kayıpsızdır. UDP\'de kayıp toleranslı teslim, gecikmeye duyarlı yükler '
-      + '(ses, video, oyun) için doğru olandır: geciken bir paket, düşen bir paketten kötüdür.</div>'
-      + '<div class="field-row">'
-      + '<div><label for="f-public">İstenen genel port</label><input type="number" id="f-public" min="0" max="65535" value="' + esc(e.requestedPublicPort || 0) + '"></div>'
-      + '<div><label for="f-maxconns">Azami eşzamanlı bağlantı</label><input type="number" id="f-maxconns" min="0" value="' + esc(e.maxConns || 0) + '"></div>'
-      + '</div>'
-      + '<div class="field-hint">0 = havuzdan rastgele bir port. Rastgele seçim bilinçlidir: sıralı dağıtım, dışarıdan tahmin edilebilir olurdu.</div>'
-      + '<div class="field-row">'
-      + '<div><label for="f-ratein">Yükleme sınırı (Mbit/s)</label><input type="number" id="f-ratein" min="0" step="0.1" value="' + (e.rateInBps ? (e.rateInBps * 8 / 1e6) : 0) + '"></div>'
-      + '<div><label for="f-rateout">İndirme sınırı (Mbit/s)</label><input type="number" id="f-rateout" min="0" step="0.1" value="' + (e.rateOutBps ? (e.rateOutBps * 8 / 1e6) : 0) + '"></div>'
-      + '</div>'
-      + '<div class="check-row"><input type="checkbox" id="f-sticky"' + (e.sticky ? ' checked' : '') + '><label for="f-sticky">Portu bu uygulamaya sabitle (tünel gitse de ayrılı kalır)</label></div>'
-      + '<div class="check-row"><input type="checkbox" id="f-enabled"' + (e.enabled === false ? '' : ' checked') + '><label for="f-enabled">Etkin</label></div>';
+    var body = [];
+    if (!isEdit) {
+      body.push(labelFor('f-client', 'İstemci'), select('f-client', clientOptions, target));
+    }
+    body.push(
+      labelFor('f-name', 'Ad'),
+      input('f-name', 'text', e.name || '', { placeholder: 'web' }),
+      fieldRow([
+        field('f-host', 'Yerel adres',
+              input('f-host', 'text', e.localHost || '127.0.0.2', { placeholder: '127.0.0.2' })),
+        field('f-port', 'Yerel port',
+              input('f-port', 'number', e.localPort || '', { min: '1', max: '65535', placeholder: '8080' })),
+      ]),
+      hint('İstemcinin KENDİ ağında bağlanacağı adres. Örn. 127.0.0.2:8080 ya da 127.0.0.9:5432.'),
+      fieldRow([
+        field('f-proto', 'Protokol', select('f-proto', [
+          { value: 'tcp', label: 'TCP' }, { value: 'udp', label: 'UDP' },
+        ], e.protocol === 'udp' ? 'udp' : 'tcp')),
+        field('f-delivery', 'Teslim', select('f-delivery', [
+          { value: 'reliable', label: 'Kayıpsız' },
+          { value: 'unreliable', label: 'Kayıp toleranslı' },
+        ], e.delivery === 'unreliable' ? 'unreliable' : 'reliable')),
+      ]),
+      hint('TCP her zaman kayıpsızdır. UDP\'de kayıp toleranslı teslim, gecikmeye duyarlı '
+           + 'yükler (ses, video, oyun) için doğru olandır: geciken bir paket, düşen bir '
+           + 'paketten kötüdür.'),
+      fieldRow([
+        field('f-public', 'İstenen genel port',
+              input('f-public', 'number', e.requestedPublicPort || 0, { min: '0', max: '65535' })),
+        field('f-maxconns', 'Azami eşzamanlı bağlantı',
+              input('f-maxconns', 'number', e.maxConns || 0, { min: '0' })),
+      ]),
+      hint('0 = havuzdan rastgele bir port. Rastgele seçim bilinçlidir: sıralı dağıtım, '
+           + 'dışarıdan tahmin edilebilir olurdu.'),
+      fieldRow([
+        field('f-ratein', 'Yükleme sınırı (Mbit/s)',
+              input('f-ratein', 'number', e.rateInBps ? (e.rateInBps * 8 / 1e6) : 0, { min: '0', step: '0.1' })),
+        field('f-rateout', 'İndirme sınırı (Mbit/s)',
+              input('f-rateout', 'number', e.rateOutBps ? (e.rateOutBps * 8 / 1e6) : 0, { min: '0', step: '0.1' })),
+      ]),
+      checkbox('f-sticky', 'Portu bu uygulamaya sabitle (tünel gitse de ayrılı kalır)', e.sticky),
+      checkbox('f-enabled', 'Etkin', e.enabled !== false),
+    );
 
-    openModal(isEdit ? ('Uygulamayı düzenle — ' + e.name) : 'Uygulama ekle', html, function () {
+    openModal(isEdit ? ('Uygulamayı düzenle — ' + e.name) : 'Uygulama ekle', body, function () {
       var payload = {
         name: $('f-name').value.trim(),
         localHost: $('f-host').value.trim(),
@@ -531,132 +833,123 @@
       }
       payload.clientId = $('f-client') ? $('f-client').value : clientId;
       if (!payload.clientId) return Promise.reject(new Error('İstemci seçin'));
-      return api('/api/apps', { method: 'POST', body: payload })
-        .then(function (created) {
-          showOk(created && created.publicPort
-            ? ('Uygulama yayında: ' + (created.publicHost || '') + ':' + created.publicPort)
-            : 'Uygulama kaydedildi; istemci bağlandığında yayına alınacak.');
-          return LOADERS.apps();
-        });
+      return api('/api/apps', { method: 'POST', body: payload }).then(function (created) {
+        showOk(created && created.publicPort
+          ? ('Uygulama yayında: ' + (created.publicHost || '') + ':' + created.publicPort)
+          : 'Uygulama kaydedildi; istemci bağlandığında yayına alınacak.');
+        return LOADERS.apps();
+      });
     }, isEdit ? 'Güncelle' : 'Oluştur');
   }
+
   $('btn-new-app').addEventListener('click', function () { openAppModal(null, null); });
 
   LOADERS.apps = function () {
-    return Promise.all([api('/api/apps'), state.clients.length ? Promise.resolve(null) : api('/api/clients')])
-      .then(function (r) {
-        state.apps = r[0].apps;
-        if (r[1]) state.clients = r[1].clients;
-        renderApps();
-      }).catch(function (e) { showErr(e.message); });
+    return Promise.all([
+      api('/api/apps'),
+      state.clients.length ? Promise.resolve(null) : api('/api/clients'),
+    ]).then(function (res) {
+      state.apps = res[0].apps;
+      if (res[1]) state.clients = res[1].clients;
+      renderApps();
+    }).catch(fail);
   };
 
   // ======================================================================
   // PORT HAVUZU
   // ======================================================================
   LOADERS.ports = function () {
-    return api('/api/ports').then(function (r) {
-      var s = r.stats;
-      $('port-stats').innerHTML = [
+    return api('/api/ports').then(function (res) {
+      var s = res.stats;
+      renderStats('port-stats', [
         ['Havuz', s.poolMin + '–' + s.poolMax, s.poolSize + ' port'],
         ['Kullanımda', s.active, 'canlı tünellere ayrılmış'],
         ['Beklemede', s.linger, 'kopan tünel için tutuluyor'],
         ['Boş', s.free, s.unusable + ' kullanılamaz'],
-      ].map(function (x) {
-        return '<div class="stat"><div class="stat-label">' + esc(x[0]) + '</div>'
-          + '<div class="stat-value' + (String(x[1]).length > 9 ? ' sm' : '') + '">' + esc(x[1]) + '</div>'
-          + '<div class="stat-note">' + esc(x[2]) + '</div></div>';
-      }).join('');
+      ]);
 
       var tb = $('ports-body');
-      if (!r.reservations.length) { emptyRow(tb, 6, 'Rezervasyon yok.'); return; }
-      tb.innerHTML = '';
-      r.reservations.sort(function (a, b) { return a.port - b.port; }).forEach(function (p) {
+      if (!res.reservations.length) { emptyRow(tb, 6, 'Rezervasyon yok.'); return; }
+      clear(tb);
+      res.reservations.sort(function (a, b) { return a.port - b.port; }).forEach(function (p) {
         var tr = tb.insertRow();
-        td(tr, '<span class="mono">' + p.port + '</span>', 'num');
-        td(tr, '<span class="badge badge-neutral">' + esc(p.proto) + '</span>');
-        td(tr, '<span class="mono cell-sub">' + esc(short(p.appId, 20)) + '</span>');
-        td(tr, '<span class="mono cell-sub">' + esc(short(p.tunnelId, 20)) + '</span>');
+        td(tr, mono(String(p.port)), 'num');
+        td(tr, badge(p.proto, 'neutral'));
+        td(tr, mono(short(p.appId, 20), 'cell-sub'));
+        td(tr, mono(short(p.tunnelId, 20), 'cell-sub'));
         td(tr, p.state === 'active'
-          ? '<span class="badge badge-ok">etkin</span>'
-          : '<span class="badge badge-warn">bekliyor</span>' + (p.sticky ? ' <span class="badge badge-dark">sabit</span>' : ''));
+          ? badge('etkin', 'ok')
+          : [badge('bekliyor', 'warn'), p.sticky ? ' ' : null, p.sticky ? badge('sabit', 'dark') : null]);
         td(tr, date(p.since));
       });
-    }).catch(function (e) { showErr(e.message); });
+    }).catch(fail);
   };
 
   // ======================================================================
   // KORUMA
   // ======================================================================
   LOADERS.guard = function () {
-    return api('/api/guard').then(function (r) {
-      var g = r.stats;
+    return api('/api/guard').then(function (res) {
+      var g = res.stats;
       $('count-bans').textContent = g.bannedIps;
-      $('guard-stats').innerHTML = [
+      renderStats('guard-stats', [
         ['Kabul edilen', g.accepted, g.connectionsGlobal + ' açık bağlantı'],
         ['Reddedilen', g.refused, g.distinctSourceIps + ' farklı kaynak'],
         ['Yasaklı', g.bannedIps, g.watchedIps + ' izlenen'],
         ['UDP', g.udpAccepted, g.udpDropped + ' düşürülen · ' + g.udpFlows + ' akış'],
         ['Yükseltme engeli', g.amplificationBlocked, 'doğrulanmamış kaynağa yanıt'],
         ['Slowloris', g.slowlorisKilled, 'ilk bayt beklenmeden düşürüldü'],
-      ].map(function (x) {
-        return '<div class="stat"><div class="stat-label">' + esc(x[0]) + '</div>'
-          + '<div class="stat-value">' + esc(x[1]) + '</div>'
-          + '<div class="stat-note">' + esc(x[2]) + '</div></div>';
-      }).join('');
+      ]);
 
       var tb = $('bans-body');
-      if (!r.bans.length) { emptyRow(tb, 4, 'Yasaklı kaynak yok.'); } else {
-        tb.innerHTML = '';
-        r.bans.forEach(function (b) {
+      if (!res.bans.length) {
+        emptyRow(tb, 4, 'Yasaklı kaynak yok.');
+      } else {
+        clear(tb);
+        res.bans.forEach(function (b) {
           var tr = tb.insertRow();
-          td(tr, '<span class="mono">' + esc(b.ip) + '</span>');
+          td(tr, mono(b.ip));
           td(tr, String(b.offences), 'num');
           td(tr, duration(b.remainingMs), 'num');
-          var cell = tr.insertCell();
-          var btn = document.createElement('button');
-          btn.className = 'btn btn-sm';
-          btn.textContent = 'Yasağı kaldır';
-          btn.addEventListener('click', function () {
+          td(tr, btn('Yasağı kaldır', null, function () {
             api('/api/guard/bans/' + encodeURIComponent(b.ip), { method: 'DELETE' })
               .then(function () { showOk('Yasak kaldırıldı.'); return LOADERS.guard(); })
-              .catch(function (err) { showErr(err.message); });
-          });
-          cell.appendChild(btn);
+              .catch(fail);
+          }));
         });
       }
 
       var lt = $('guard-limits');
-      lt.innerHTML = '';
-      Object.keys(r.limits).sort().forEach(function (k) {
+      clear(lt);
+      Object.keys(res.limits).sort().forEach(function (k) {
         var tr = lt.insertRow();
-        td(tr, '<span class="mono">' + esc(k) + '</span>');
-        td(tr, esc(r.limits[k]), 'num');
+        td(tr, mono(k));
+        td(tr, String(res.limits[k]), 'num');
       });
-    }).catch(function (e) { showErr(e.message); });
+    }).catch(fail);
   };
 
   // ======================================================================
   // DENETİM
   // ======================================================================
   LOADERS.events = function () {
-    return api('/api/events?limit=200').then(function (r) {
+    return api('/api/events?limit=200').then(function (res) {
       var tb = $('events-body');
-      if (!r.events.length) { emptyRow(tb, 5, 'Kayıt yok.'); return; }
-      tb.innerHTML = '';
-      r.events.forEach(function (ev) {
+      if (!res.events.length) { emptyRow(tb, 5, 'Kayıt yok.'); return; }
+      clear(tb);
+      res.events.forEach(function (ev) {
         var tr = tb.insertRow();
         td(tr, date(ev.at), 'num');
-        td(tr, '<span class="badge badge-neutral">' + esc(ev.kind) + '</span>');
-        td(tr, esc(ev.actor || '—'));
-        td(tr, '<span class="mono cell-sub">' + esc(short(ev.subject, 24)) + '</span>');
-        td(tr, '<span class="cell-sub mono">' + esc(short(ev.detail, 90)) + '</span>');
+        td(tr, badge(ev.kind, 'neutral'));
+        td(tr, ev.actor || '—');
+        td(tr, mono(short(ev.subject, 24), 'cell-sub'));
+        td(tr, mono(short(ev.detail, 90), 'cell-sub'));
       });
-    }).catch(function (e) { showErr(e.message); });
+    }).catch(fail);
   };
 
   // ======================================================================
-  // canlı akış + başlangıç
+  // Canlı akış + başlangıç
   // ======================================================================
   $('btn-refresh').addEventListener('click', function () {
     clearBanners();
@@ -681,8 +974,8 @@
       // Tünel açıldı/kapandı: yalnızca AÇIK olan görünümü tazele. Hepsini
       // yenilemek, on tünelin aynı anda bağlandığı bir anda paneli kendi
       // kendine yük üreten bir şeye çevirirdi.
-      var active = document.querySelector('.nav-item.active');
-      if (active && LOADERS[active.dataset.view]) LOADERS[active.dataset.view]();
+      var view = activeView();
+      if (view && LOADERS[view]) LOADERS[view]();
     });
     es.addEventListener('error', function () {
       $('live').classList.remove('on');
@@ -690,10 +983,11 @@
     });
   }
 
-  // Tüneller görünümü canlı veriye dayanıyor: açıkken periyodik tazeleme.
+  // Tünel ve ziyaretçi görünümleri canlı veriye dayanıyor: açıkken tazele.
   setInterval(function () {
-    var active = document.querySelector('.nav-item.active');
-    if (active && active.dataset.view === 'tunnels') LOADERS.tunnels();
+    var view = activeView();
+    if (view === 'tunnels') LOADERS.tunnels();
+    else if (view === 'peers' && $('peer-auto').checked) LOADERS.peers();
   }, 5000);
 
   LOADERS.clients().then(LOADERS.overview).then(connectStream);

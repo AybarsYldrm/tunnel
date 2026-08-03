@@ -392,19 +392,20 @@ Notlar:
 
 ---
 
-## Güvenilir / sırasız kanal (QUIC — RFC 9002)
+## Güvenilir / sırasız kanal (RFC 9002 + BBRv3)
 
 UDP'de kayıp normaldir. Bazı veriler için bu kabul edilebilir değildir ama
 **TCP'nin head-of-line blocking'i de istenmez.** `reliable` seçeneği tam olarak
-bu boşluğu doldurur — kayıp kurtarma ve tıkanıklık denetimi **RFC 9002'nin
-(QUIC Loss Detection and Congestion Control)** modelini izler.
+bu boşluğu doldurur: kayıp tespiti **RFC 9002'nin (QUIC Loss Detection)**
+modelini izler, tıkanıklık denetimi ise **takılabilir** — varsayılan **BBRv3**.
 
 ```js
 const reliable = {
-  ordered: false,        // varsayılan: SIRASIZ teslim
-  maxRetransmits: 12,    // parça başına vazgeçme sınırı
-  initialRtt: 333,       // RTT örneği alınana kadarki tahmin (ms)
-  ackDelay: 10,          // ACK'leri toplama gecikmesi (ms)
+  ordered: false,             // varsayılan: SIRASIZ teslim
+  congestionControl: 'bbr3',  // varsayılan; 'newreno' de seçilebilir
+  maxRetransmits: 12,         // parça başına vazgeçme sınırı
+  initialRtt: 333,            // RTT örneği alınana kadarki tahmin (ms)
+  ackDelay: 10,               // ACK'leri toplama gecikmesi (ms)
 };
 
 const sock = await dtls.connect({ host, port, ca, reliable });
@@ -428,7 +429,7 @@ kütüphanenin önceki sürümü **her üçüne de** düşüyordu:
 |---|---|---|
 | **Tek paket kurtarma** | Zaman aşımında yalnızca en eski paketi gönder → N kayıp için N tur | ACK bilgisinden **tüm** kayıpları aynı anda çıkar (§6.1) |
 | **Kör üstel geri çekilme** | Her zaman aşımında RTO'yu ikiye katla → kayıp tıkanıklıktan değilse kurtarma durur | **PTO** yalnızca sonda gönderir; kayıp İLAN ETMEZ, pencereyi küçültmez (§6.2) |
-| **Açık döngü gönderim** | Sabit `maxInFlight` ne kapasiteyi kullanır ne tıkanıklığa tepki verir | **NewReno**: pencere ACK'lerle büyür, kayıpta yarılanır (§7) |
+| **Açık döngü gönderim** | Sabit `maxInFlight` ne kapasiteyi kullanır ne tıkanıklığa tepki verir | Pencere ölçüme göre belirlenir (§7 — burada **BBRv3**) |
 
 Uygulanan mekanizmalar:
 
@@ -437,8 +438,8 @@ Uygulanan mekanizmalar:
 * **Kayıp tespiti** (§6.1) — paket eşiği (3) **ve** zaman eşiği (9/8 × RTT).
 * **PTO** (§6.2) — `smoothed_rtt + max(4·rttvar, granülerlik) + max_ack_delay`,
   üstel geri çekilmeyle; zaman aşımında **iki sonda** gönderilir.
-* **NewReno tıkanıklık denetimi** (§7) — yavaş başlangıç, kurtarma dönemi,
-  kalıcı tıkanıklık tespiti.
+* **Tıkanıklık denetimi** (§7) — varsayılan BBRv3 (aşağıda), alternatif
+  NewReno: yavaş başlangıç, kurtarma dönemi, kalıcı tıkanıklık tespiti.
 * **Yeniden gönderilen veri YENİ paket numarası alır** — böylece her ACK tek bir
   gönderime karşılık gelir ve RTT örnekleri belirsizliğe düşmez (Karn'a gerek
   kalmaz). Veri kimliği `(streamId, msgId, idx)` üçlüsüdür; alıcı yinelemeyi
@@ -448,6 +449,73 @@ Uygulanan mekanizmalar:
   bekletmez; tamamlanan mesaj anında yukarı çıkar.
 * **Sıralı teslim** (`ordered: true`) — akış (`streamId`) içinde sıra korunur;
   farklı akışlar birbirini etkilemez.
+
+### Tıkanıklık denetimi: BBRv3 (varsayılan)
+
+Kayıp odaklı denetleyicilerin tamamı (Reno, NewReno, CUBIC) tek bir varsayımı
+paylaşır: **kayıp = tıkanıklık**. Bu varsayım iki çok yaygın durumda yanlıştır.
+
+**1. Kayıp tıkanıklıktan gelmiyor.** Mobil, Wi-Fi ve uydu hatlarında kayıp
+rastgele bit hatasından doğar. Mathis formülüne göre kayıp odaklı bir
+denetleyicinin ulaşabileceği tavan `≈ MSS / (RTT · √p)`'dir: %1 kayıplı,
+40 ms'lik bir hatta bu ~3 Mbit/s demektir — hat 100 Mbit olsa bile.
+
+**2. Tampon şişmesi (bufferbloat).** Kayıp yalnızca darboğazdaki kuyruk
+TAŞTIĞINDA gelir; dolayısıyla kayıp odaklı denetleyici kuyruğu doldurmayı
+*hedefler*. Sonuç, aynı hattı paylaşan her şeyin (SSH, oyun, ses) yüz
+milisaniyelerce gecikme yemesidir.
+
+BBR bunun yerine hattın **darboğaz bant genişliğini** ve **en küçük gidiş-dönüş
+süresini** ölçer, gönderim hızını doğrudan bu modelden türetir ve paketleri
+zamana yayar (pacing). Kuyruğu doldurmadan darboğaz hızında gönderir.
+
+Bu depodaki deterministik hat benzetiminin ölçtüğü (`npm run test:bbr`,
+30 sn/senaryo, tohumlu rastgelelik):
+
+| Senaryo | BBRv3 | NewReno | Fark |
+|---|---|---|---|
+| Temiz 10 Mbit/40 ms | %98.5 kullanım, 23 ms kuyruk | %99.4, 76 ms | verim eşit, **gecikme 3× düşük** |
+| %1 rastgele kayıp | %89.3 | %26.3 | **3.4×** |
+| %2 rastgele kayıp | %78.6 | %18.7 | **4.2×** |
+| Derin tampon (512 KB) | %98.6, 23 ms | %99.4, **239 ms** | **10× az kuyruk gecikmesi** |
+| Uzun mesafe 150 ms, %0.5 kayıp | %76.9 | %5.1 | **15×** |
+
+Uygulanan BBRv3 mekanizmaları:
+
+* **Teslim hızı örneklemesi** — `delivered / max(gönderim_aralığı, ack_aralığı)`.
+  Paydadaki maksimum, ACK'leri yığın hâlinde gönderen ağlarda (Wi-Fi, LTE)
+  hızın olduğundan büyük görünmesini engeller.
+* **Durum makinesi** — Startup → Drain → ProbeBW (Down/Cruise/Refill/Up) → ProbeRTT.
+* **Kayıp tabanlı üst sınırlar** (v2/v3) — `inflight_hi` / `bw_hi` uzun vadeli,
+  `inflight_lo` / `bw_lo` kısa vadeli tavan. Kayıp değerlendirmesi **tur
+  başınadır**, ACK başına değil: tek bir ACK yığınındaki kayıp oranı
+  istatistiksel gürültüdür ve ona tepki vermek BBR'ı NewReno'nun altına indirir.
+* **ACK yığılması telafisi** (`extra_acked`) — ACK'ler toplu geldiğinde pencere
+  BDP'de kalırsa hat ACK'ler arasında boş kalır; fark ölçülüp pencereye eklenir.
+* **ProbeRTT** — `min_rtt` 10 saniyedir tazelenmediyse pencere 200 ms boyunca
+  yarı BDP'ye indirilip gerçek gecikme ölçülür (%2'den az verim maliyeti).
+* **Pacing** — jeton kovası; ~1 ms'lik patlama payı bırakılır, çünkü paket başına
+  zamanlayıcı kurmak Node'un 1 ms çözünürlüğünde ~10 Mbit'lik yapay bir tavan
+  yaratırdı. Bant genişliği örneği oluşana kadar hız sınırı yoktur.
+* **Uygulama sınırı işaretleme** — gönderilecek veri kalmadığında örnekler
+  `app-limited` damgalanır; aksi hâlde BBR, boş kalan hattı yavaş bir hat sanar.
+
+`newreno` hâlâ tam olarak destekleniyor ve RFC 9002 §7 sözleşmesini birebir
+uyguluyor:
+
+```js
+const sock = await dtls.connect({
+  host, port, ca,
+  reliable: { congestionControl: 'newreno' },
+});
+```
+
+> **Pacing marjı neden %2?** Linux'ta %1'dir. Bu yığın zamanı milisaniye
+> cinsinden okur (çekirdek mikrosaniye kullanır); 40 ms'lik bir örnekleme
+> aralığında ±1 ms yuvarlama %2.5 hata demektir ve bant genişliği tahmini
+> *pencereli maksimum* olduğu için bu hatanın sistematik olarak pozitif ucunu
+> seçer. %1'lik pay o gürültünün altında kalır ve fark kalıcı kuyruk olarak
+> birikir.
 
 > **Bu katman DTLS'in yapısını değiştirmez.** Tamamen `application_data`'nın
 > içinde bir çerçeveleme katmanıdır; kayıt katmanı, epoch'lar, replay penceresi ve
@@ -459,10 +527,13 @@ Kalıcı kayıpta `send()` reddedilir (`maxRetransmits` aşılınca). Ölçümle
 ```js
 sock.reliable.rttMs             // güncel smoothed_rtt
 sock.reliable.congestionWindow  // bayt
+sock.reliable.pacingRate        // hedef gönderim hızı (bayt/s) ya da null
+sock.reliable.congestionControl // 'bbr3' | 'newreno'
 sock.reliable.getStats()
 // { sent, resent, acked, lost, probes, giveUps, duplicates,
 //   smoothedRtt, rttvar, minRtt, pto, ptoCount,
 //   congestionWindow, bytesInFlight, ssthresh,
+//   cc, state, bandwidthBps, pacingRateBps, bdp, extraAcked, appLimited,
 //   packetsLost, congestionEvents, persistentCongestion, queued, ... }
 ```
 
@@ -556,12 +627,12 @@ Olaylar: `connect`, `data`, `media`, `rtcp`, `alert`, `error`, `close`,
 | `servername` / `sni` | host | SNI + hostname doğrulaması |
 | `contexts`, `SNICallback` | — | Sunucuda hostname başına sertifika |
 | `minVersion`, `maxVersion` | `DTLSv1.2` / `DTLSv1.3` | Sürüm aralığı |
-| `cipherSuites` | tümü | İsim veya ID listesi |
+| `cipherSuites` / `cipher` | `'balanced'` | Politika adı (`balanced`, `aes128`, `aes256`, `aes`, `chacha20`, `mobile`) **veya** isim/ID listesi |
 | `groups` | `X25519, SECP256R1` | ECDHE eğrileri |
 | `sigSchemes` | ECDSA/PSS/Ed25519 | İmza şemaları |
 | `alpn` | — | Protokol listesi |
 | `srtp` | `false` | `true` veya `{ profiles, replayProtection, demux }` |
-| `reliable` | `false` | `true` veya `{ ordered, rto, maxRetransmits, maxInFlight, ... }` |
+| `reliable` | `false` | `true` veya `{ ordered, congestionControl, maxRetransmits, ... }` |
 | `extendedMasterSecret` | `true` | RFC 7627 (DTLS 1.2) |
 | `cookie` | `true` | HelloRetryRequest / HelloVerifyRequest ile DoS koruması |
 | `mtu` | `1200` | Datagram bütçesi; handshake buna göre parçalanır |
@@ -570,6 +641,44 @@ Olaylar: `connect`, `data`, `media`, `rtcp`, `alert`, `error`, `close`,
 | `maxSessions` | `10000` | Sunucu: eşzamanlı oturum sınırı |
 | `rateLimitBurst` / `rateLimitPerSec` | `30` / `15` | Sunucu: kaynak başına yeni oturum hızı |
 | `keylogFile` | `SSLKEYLOGFILE` | Wireshark için NSS anahtar günlüğü |
+
+---
+
+## Şifreleme paketi seçimi
+
+Suite listesini elle yazmak, DTLS 1.3 ve 1.2 karşılıklarını da elle eşlemek
+demektir; birini unutmak "el sıkışma başarısız" olarak geri döner ve sebebi
+görünmez. **Politika adı** bu eşlemeyi tek yerde yapar:
+
+```js
+// Tek kelime: hem 1.3 hem 1.2 karşılıkları, doğru sırayla kurulur.
+await dtls.connect({ host, port, ca, cipher: 'chacha20' });
+
+// Açık liste de kabul edilir — verilen SIRA tercih sırasıdır.
+dtls.createServer({ cert, key, cipherSuites: [
+  'TLS_AES_256_GCM_SHA384',
+  'TLS_AES_128_GCM_SHA256',
+]});
+
+// Politikalar birleştirilebilir.
+await dtls.connect({ host, port, ca, cipher: ['chacha20', 'aes128'] });
+```
+
+| Politika | İçerik | Ne zaman |
+|---|---|---|
+| `balanced` *(varsayılan)* | AES-128 → AES-256 → ChaCha20 | AES-NI olan her makine — yani 2010 sonrası hemen her sunucu/masaüstü |
+| `aes128` / `aes256` / `aes` | yalnızca AES-GCM | Uzun anahtar isteyen kurumsal politikalar; ChaCha20 **FIPS 140-3 onaylı değildir** |
+| `chacha20` | yalnızca ChaCha20-Poly1305 | AES donanım hızlandırması **olmayan** uçlar: ARM Cortex-A (eski Raspberry Pi), gömülü yönlendiriciler, düşük seviye mobil yongalar |
+| `mobile` | ChaCha20 → AES | Karışık istemci parkı — hızlı ucun seçimi yavaş uca dayatılmasın |
+
+Takma adlar da çalışır: `chacha`, `aes-128`, `strong`, `arm`, `embedded`, `fips`.
+
+> AES-128'in kırıldığına dair bir bulgu **yoktur**; `aes256` bir uyum tercihidir,
+> güvenlik yükseltmesi değil. Gerçek fark, AES hızlandırması olmayan bir uçta
+> ChaCha20'ye geçmektir — orada kazanç kat cinsindendir.
+
+Yalnızca AEAD suite'leri desteklenir. CBC / MAC-then-encrypt (Lucky13, POODLE)
+bilinçli olarak **yoktur**.
 
 ---
 
@@ -651,6 +760,7 @@ npm run test:mtls       # mTLS, sertifika zincirleri, doğrulama (her iki sürü
 npm run test:revocation # OCSP + CRL (gerçek HTTP responder ile)
 npm run test:srtp       # DTLS-SRTP (her iki sürümde, 4 profil)
 npm run test:reliable   # güvenilir kanal, %50'ye varan yapay kayıpla
+npm run test:bbr        # BBRv3 — deterministik hat benzetimi (kayıp, tampon, RTT)
 npm run test:retransmit # uçuş yeniden gönderimi
 npm run test:robust     # bozuk girdi, replay, kaynak sınırları
 ```
@@ -697,7 +807,9 @@ src/
     pki.js                   zincir kurma ve yol doğrulama
     revocation.js            OCSP (RFC 6960) + CRL (RFC 5280) istemcisi
   reliable/
-    recovery.js              RFC 9002 kayıp tespiti + NewReno tıkanıklık denetimi
+    recovery.js              RFC 9002 kayıp tespiti + RTT tahmini + PTO
+    congestion.js            takılabilir tıkanıklık denetimi: BBRv3 (varsayılan), NewReno
+    pacing.js                jeton kovası hız şekillendirici (BBR için zorunlu)
     channel.js               çerçeveleme, akışlar, parçalama/birleştirme
   transport/udp.js, stun.js
 
@@ -705,7 +817,10 @@ tunnel/                      mTLS ters proxy uygulaması — bkz. tunnel/README.
   src/protocol/              FTP v1 çerçeveleri ve ikili kodlayıcı
   src/common/mux.js          çoklama, kredi tabanlı akış denetimi, DRR
   src/server/                DTLS dinleyici, port havuzu, koruma, yönetim yüzeyi
+  src/server/peers.js        genel yüzeye bağlanan uçlar: pasif gecikme ölçümü, at/engelle
+  src/server/admin/          yönetim REST + sıkı CSP'li panel (satır içi script/stil YOK)
   src/client/                cihaz kodu girişi, CSR, yerel hedeflere bağlanma
+  config.example.js          yapılandırma dosyası şablonu (config.js olarak kopyalayın)
 ```
 
 ### Neden sürüm başına ayrı dosya yok?

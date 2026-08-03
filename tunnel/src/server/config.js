@@ -7,7 +7,20 @@
 //
 // Sır olmayan her şeyin makul bir varsayılanı vardır: tek makinelik bir
 // kurulumun on beş ortam değişkeni yazması gerekmemeli.
+//
+// ÜÇ KATMAN, net bir öncelik sırasıyla (sonraki öncekini ezer):
+//
+//   1. koddaki varsayılanlar
+//   2. ortam değişkenleri            — kapsayıcı/systemd dünyasının dili
+//   3. yapılandırma DOSYASI          — `config.js`, elle yönetilen kurulumların
+//   4. çağrıya geçilen `overrides`   — testler ve gömülü kullanım
+//
+// Dosya neden ortamın ÜSTÜNDE? Çünkü dosyayı yazan kişi onu bilerek yazmıştır;
+// ortam değişkeni ise kabuktan, kapsayıcı imajından ya da CI'dan sızmış
+// olabilir. "Dosyada ne yazıyorsa o çalışır" kuralı, teşhis edilebilir tek
+// davranış.
 
+const fs = require('node:fs');
 const path = require('node:path');
 
 class ConfigError extends Error {
@@ -36,6 +49,68 @@ const envBool = (name, fallback) => {
 /** Mbit/s → bayt/s. Panel ve ortam değişkenleri Mbit konuşur, motor bayt. */
 const mbitToBytes = (mbit) => (mbit > 0 ? Math.floor((mbit * 1_000_000) / 8) : 0);
 
+/** İç içe nesneleri birleştirir; dizi ve ilkel değerler ezilir. */
+function deepMerge(base, patch) {
+  if (!patch || typeof patch !== 'object') return base;
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === undefined) continue;
+    if (v && typeof v === 'object' && !Array.isArray(v)
+        && base[k] && typeof base[k] === 'object' && !Array.isArray(base[k])) {
+      deepMerge(base[k], v);
+    } else {
+      base[k] = v;
+    }
+  }
+  return base;
+}
+
+/**
+ * Yapılandırma dosyasını bulur ve yükler.
+ *
+ * Arama sırası: açıkça verilen yol → FITFAK_TUNNEL_CONFIG → paket kökündeki
+ * `config.js`. Hiçbiri yoksa `null` — dosya ZORUNLU DEĞİL.
+ *
+ * Dosya bir nesne ya da nesne döndüren bir fonksiyon dışa aktarabilir;
+ * `loadServerConfig` adında bir dışa aktarım varsa (bu dosyanın kendi biçimi)
+ * o çağrılır. Böylece kullanıcı, tam gövdeli bir yapılandırma dosyasını da
+ * kısmi bir yamayı da aynı yere koyabilir.
+ */
+function loadConfigFile(explicitPath) {
+  const root = path.join(__dirname, '..', '..');
+  const candidates = [
+    explicitPath,
+    process.env.FITFAK_TUNNEL_CONFIG,
+    path.join(root, 'config.js'),
+    path.join(root, 'config.json'),
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    const file = path.resolve(candidate);
+    if (!fs.existsSync(file)) {
+      // Açıkça istenen bir dosyanın yokluğu sessiz geçilmez: kullanıcı onu
+      // yazdığını sanıp neden hiçbir ayarının tutmadığını arar.
+      if (candidate === explicitPath || candidate === process.env.FITFAK_TUNNEL_CONFIG) {
+        throw new ConfigError(`yapılandırma dosyası bulunamadı: ${file}`);
+      }
+      continue;
+    }
+    let loaded;
+    try {
+      // eslint-disable-next-line global-require, import/no-dynamic-require
+      loaded = require(file);
+    } catch (err) {
+      throw new ConfigError(`yapılandırma dosyası okunamadı (${file}): ${err.message}`);
+    }
+    const value = typeof loaded === 'function' ? loaded()
+      : (typeof loaded?.loadServerConfig === 'function' ? loaded.loadServerConfig() : loaded);
+    if (!value || typeof value !== 'object') {
+      throw new ConfigError(`yapılandırma dosyası bir nesne döndürmeli: ${file}`);
+    }
+    return { file, value };
+  }
+  return null;
+}
+
 function loadServerConfig(overrides = {}) {
   const root = path.join(__dirname, '..', '..');
   const dataDir = env('FITFAK_TUNNEL_DATA_DIR', path.join(root, '.tunnel-data'));
@@ -62,6 +137,27 @@ function loadServerConfig(overrides = {}) {
      * kalmasıdır. OCSP/CRL erişilemiyorsa bağlanmamak doğru olan.
      */
     revocation: env('FITFAK_TUNNEL_REVOCATION', 'hard-fail'),
+
+    /**
+     * Şifreleme paketi tercihi. Politika adı ya da açık suite listesi.
+     *
+     *   balanced  (varsayılan) AES-128-GCM önce — AES-NI olan her makinede en hızlı
+     *   aes256    daha uzun anahtar isteyen kurumsal politikalar için
+     *   chacha20  AES donanım hızlandırması olmayan uçlar (ARM, gömülü)
+     *   mobile    ChaCha20 önce, AES yedek — karışık istemci parkı
+     *
+     * Ayrıntı ve tam liste: src/crypto/cipher-suite.js
+     */
+    cipher: env('FITFAK_TUNNEL_CIPHER', 'balanced'),
+
+    /**
+     * Tıkanıklık denetimi: 'bbr3' (varsayılan) ya da 'newreno'.
+     *
+     * BBRv3 hattın darboğaz hızını ve en küçük gecikmesini ÖLÇER; kaybı
+     * tıkanıklık sanmaz. Kayıplı ya da uzun mesafeli hatlarda fark kat
+     * cinsindendir. Gerekçenin tamamı: src/reliable/congestion.js
+     */
+    congestionControl: env('FITFAK_TUNNEL_CONGESTION_CONTROL', 'bbr3'),
 
     // ---- genel (dış dünyaya bakan) yüzey --------------------------------------------------
     publicHost: env('FITFAK_TUNNEL_PUBLIC_HOST', '0.0.0.0'),
@@ -94,6 +190,31 @@ function loadServerConfig(overrides = {}) {
       sessionTtlMs: envInt('FITFAK_TUNNEL_ADMIN_SESSION_TTL_MS', 8 * 3600_000),
       /** Kimlik doğrulaması olmadan çalıştırma — YALNIZCA yerel geliştirme. */
       insecureNoAuth: envBool('FITFAK_TUNNEL_ADMIN_INSECURE_NO_AUTH', false),
+
+      /**
+       * İçerik güvenliği politikası.
+       *
+       * Varsayılan: panel kendi kaynaklarından başka HİÇBİR yere gitmez.
+       * Üçüncü taraf bir betiğe (ör. Cloudflare Web Analytics) izin vermek
+       * bilinçli bir karardır ve burada açıkça verilir — sessiz bir varsayılan
+       * olarak değil.
+       *
+       * `'unsafe-inline'` / `'unsafe-eval'` buradan da AÇILAMAZ; listeye
+       * yazılsalar bile süzülürler (admin/server.js buildCsp).
+       */
+      csp: {
+        /** Cloudflare'in enjekte ettiği beacon.min.js'e izin ver. */
+        cloudflareInsights: envBool('FITFAK_TUNNEL_ADMIN_CSP_CLOUDFLARE', false),
+        /** Ek betik kaynakları (tam köken: https://cdn.example.com). */
+        scriptSrc: (env('FITFAK_TUNNEL_ADMIN_CSP_SCRIPT_SRC', '') || '').split(/[\s,]+/).filter(Boolean),
+        /** Ek bağlantı hedefleri (fetch/XHR/EventSource). */
+        connectSrc: (env('FITFAK_TUNNEL_ADMIN_CSP_CONNECT_SRC', '') || '').split(/[\s,]+/).filter(Boolean),
+        imgSrc: (env('FITFAK_TUNNEL_ADMIN_CSP_IMG_SRC', '') || '').split(/[\s,]+/).filter(Boolean),
+        /** Trusted Types — innerHTML'i tarayıcı seviyesinde yasaklar. */
+        trustedTypes: envBool('FITFAK_TUNNEL_ADMIN_CSP_TRUSTED_TYPES', true),
+        /** İhlal raporlarının gönderileceği uç (isteğe bağlı). */
+        reportUri: env('FITFAK_TUNNEL_ADMIN_CSP_REPORT_URI', ''),
+      },
     },
 
     // ---- veritabanı -----------------------------------------------------------------------
@@ -134,11 +255,19 @@ function loadServerConfig(overrides = {}) {
     metricsIntervalMs: envInt('FITFAK_TUNNEL_METRICS_INTERVAL_MS', 60_000),
   };
 
-  Object.assign(cfg, overrides);
-  if (overrides.admin) cfg.admin = { ...cfg.admin, ...overrides.admin };
-  if (overrides.db) cfg.db = { ...cfg.db, ...overrides.db };
-  if (overrides.limits) cfg.limits = { ...cfg.limits, ...overrides.limits };
-  if (overrides.guard) cfg.guard = { ...cfg.guard, ...overrides.guard };
+  // --- katman 3: yapılandırma dosyası (varsa)
+  const file = overrides.configFile === false
+    ? null
+    : loadConfigFile(overrides.configFile);
+  if (file) {
+    deepMerge(cfg, file.value);
+    cfg.configFile = file.file;
+  }
+
+  // --- katman 4: çağrıya geçilen değerler
+  const direct = { ...overrides };
+  delete direct.configFile;
+  deepMerge(cfg, direct);
 
   if (cfg.portMin > cfg.portMax) {
     throw new ConfigError(`FITFAK_TUNNEL_PORT_MIN (${cfg.portMin}) > FITFAK_TUNNEL_PORT_MAX (${cfg.portMax})`);
@@ -160,4 +289,5 @@ function loadServerConfig(overrides = {}) {
 
 module.exports = {
   loadServerConfig, ConfigError, mbitToBytes, env, envInt, envBool,
+  loadConfigFile, deepMerge,
 };

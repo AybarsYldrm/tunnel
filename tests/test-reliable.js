@@ -182,21 +182,32 @@ async function connectedPair(reliable, lossRate = 0) {
   // ==========================================================================
   // RFC 9002 davranışları
   // ==========================================================================
-  await r.test('kayıp altında tıkanıklık penceresi küçülür (RFC 9002 §7.3.2)', async () => {
-    const p = await connectedPair({ maxRetransmits: 40, rto: 40, ackDelay: 5 }, 0.3);
+  await r.test('kayıp altında tıkanıklık penceresi küçülür (NewReno, RFC 9002 §7.3.2)', async () => {
+    // Bu test NewReno'nun SÖZLEŞMESİNİ sınıyor: kayıp = pencere yarılanması.
+    // Varsayılan denetleyici (BBRv3) bilinçli olarak böyle davranmaz — kayıp
+    // tepkisini tur başına, oran üzerinden verir — bu yüzden NewReno açıkça
+    // isteniyor. BBRv3'ün kendi sözleşmesi test-bbr.js'te.
+    const p = await connectedPair({
+      maxRetransmits: 40, rto: 40, ackDelay: 5, congestionControl: 'newreno',
+    }, 0.3);
     const rec = p.client.reliable.recovery;
+    assert.equal(rec.congestionControl, 'newreno');
 
     // Tıkanıklık olayı anındaki pencereyi yakala: aktarım boyunca pencere
     // büyüdüğü için ÖNCEKİ değerle karşılaştırmak anlamsız olurdu — RFC 9002
     // §7.3.2'nin söylediği, ssthresh'in KAYBIN GÖRÜLDÜĞÜ ANDAKİ pencerenin
     // yarısı olduğudur.
+    // Kanca DENETLEYİCİNİN kendisine takılıyor, kurtarma katmanına değil:
+    // "kayıp olayında pencereyi yarıla" NewReno'nun sözleşmesidir, RFC 9002
+    // kayıp tespitinin değil.
+    const cc = rec.cc;
     const events = [];
-    const origEvent = rec._onCongestionEvent.bind(rec);
-    rec._onCongestionEvent = (sentTime, now) => {
-      const cwndBefore = rec.congestionWindow;
-      const inRecovery = rec._inCongestionRecovery(sentTime);
+    const origEvent = cc.congestionEvent.bind(cc);
+    cc.congestionEvent = (sentTime, now) => {
+      const cwndBefore = cc.cwnd;
+      const inRecovery = cc.inRecovery(sentTime);
       origEvent(sentTime, now);
-      if (!inRecovery) events.push({ cwndBefore, cwndAfter: rec.congestionWindow });
+      if (!inRecovery) events.push({ cwndBefore, cwndAfter: cc.cwnd });
     };
 
     const got = once(p.s, 'data', 30_000);

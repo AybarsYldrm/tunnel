@@ -8,6 +8,7 @@ const { Runner, readCert, certsAvailable } = require('./helpers.js');
 
 const {
   CONTENT_TYPE, HS_TYPE, VERSION, NAMED_GROUP, SRTP_PROFILE, SRTP_PROFILE_PARAMS, EXT_TYPE,
+  CIPHER_SUITE,
 } = require('../src/constants.js');
 const {
   encodePlaintext, decodePlaintext, readUInt48BE, writeUInt48BE,
@@ -887,6 +888,76 @@ const makeRtp = (seq, ssrc, payload) => {
     const only12 = normalizeOptions('client', { rejectUnauthorized: false, maxVersion: 'DTLSv1.2' });
     assert.deepEqual(only12.versions, [VERSION.DTLS_1_2]);
     assert.equal(only12.allow13, false);
+  });
+
+  // ---- şifreleme paketi seçimi ------------------------------------------
+  await r.test('cipher: politika adı hem 1.3 hem 1.2 listesini kurar', () => {
+    const o = normalizeOptions('client', { rejectUnauthorized: false, cipherSuites: 'chacha20' });
+    assert.deepEqual(o.cipherSuites13, [CIPHER_SUITE.TLS_CHACHA20_POLY1305_SHA256]);
+    // Politika, sürüme göre ELLE eşlenmeye bırakılmamalı: 1.2 karşılıkları da
+    // gelmezse istemci DTLS 1.2'ye düştüğünde el sıkışma sessizce başarısız olur.
+    assert.deepEqual(o.cipherSuites12, [
+      CIPHER_SUITE.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+      CIPHER_SUITE.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+    ]);
+  });
+
+  await r.test('cipher: `cipher` kısa adı `cipherSuites` ile eşdeğer', () => {
+    const a = normalizeOptions('client', { rejectUnauthorized: false, cipher: 'aes256' });
+    const b = normalizeOptions('client', { rejectUnauthorized: false, cipherSuites: 'aes256' });
+    assert.deepEqual(a.cipherSuites13, b.cipherSuites13);
+    assert.deepEqual(a.cipherSuites13, [CIPHER_SUITE.TLS_AES_256_GCM_SHA384]);
+  });
+
+  await r.test('cipher: açık suite listesi ve takma adlar', () => {
+    const byName = normalizeOptions('client', {
+      rejectUnauthorized: false, cipherSuites: ['TLS_AES_256_GCM_SHA384', 'TLS_AES_128_GCM_SHA256'],
+    });
+    assert.deepEqual(byName.cipherSuites13, [
+      CIPHER_SUITE.TLS_AES_256_GCM_SHA384, CIPHER_SUITE.TLS_AES_128_GCM_SHA256,
+    ], 'verilen SIRA korunmalı — sunucu bunu tercih sırası olarak kullanıyor');
+
+    // Takma adlar ve karışık liste.
+    const mixed = normalizeOptions('client', {
+      rejectUnauthorized: false, cipherSuites: ['chacha', 'aes-128'],
+    });
+    assert.equal(mixed.cipherSuites13[0], CIPHER_SUITE.TLS_CHACHA20_POLY1305_SHA256);
+    assert.ok(mixed.cipherSuites13.includes(CIPHER_SUITE.TLS_AES_128_GCM_SHA256));
+  });
+
+  await r.test('cipher: bilinmeyen ad politika listesiyle birlikte reddedilir', () => {
+    assert.throws(
+      () => normalizeOptions('client', { rejectUnauthorized: false, cipherSuites: 'des' }),
+      /politikalar:/,
+    );
+  });
+
+  await r.test('cipher: mobile politikası ChaCha20\'yi öne alır', () => {
+    // ARM/gömülü uçlarda AES yazılımda çalışır ve ChaCha20'den kat kat yavaştır.
+    const o = normalizeOptions('client', { rejectUnauthorized: false, cipherSuites: 'mobile' });
+    assert.equal(o.cipherSuites13[0], CIPHER_SUITE.TLS_CHACHA20_POLY1305_SHA256);
+    assert.ok(o.cipherSuites13.includes(CIPHER_SUITE.TLS_AES_128_GCM_SHA256), 'AES yedek kalmalı');
+  });
+
+  // ---- tıkanıklık denetimi seçimi ---------------------------------------
+  await r.test('reliable: tıkanıklık denetleyicisi seçilebilir', () => {
+    const bbr = normalizeOptions('client', { rejectUnauthorized: false, reliable: true });
+    assert.equal(bbr.reliable.congestionControl, undefined, 'verilmezse kanal varsayılanı geçerli');
+
+    const reno = normalizeOptions('client', {
+      rejectUnauthorized: false, reliable: { congestionControl: 'newreno' },
+    });
+    assert.equal(reno.reliable.congestionControl, 'newreno');
+
+    // Takma adlar tek kanonik ada iner.
+    const alias = normalizeOptions('client', {
+      rejectUnauthorized: false, reliable: { cc: 'bbr' },
+    });
+    assert.equal(alias.reliable.congestionControl, 'bbr3');
+
+    assert.throws(() => normalizeOptions('client', {
+      rejectUnauthorized: false, reliable: { congestionControl: 'cubic' },
+    }), /bilinmeyen denetleyici/);
   });
 
   // ======================================================================

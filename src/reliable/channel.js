@@ -9,7 +9,8 @@
 //
 // Sağladıkları:
 //   • RFC 9002 kayıp tespiti (paket eşiği + zaman eşiği) ve PTO sondaları
-//   • NewReno tıkanıklık denetimi — pencere ACK ile büyür, kayıpta yarılanır
+//   • Takılabilir tıkanıklık denetimi — BBRv3 (varsayılan) ya da NewReno,
+//     BBR ile birlikte paketleri zamana yayan hız şekillendirme (pacing)
 //   • SIRASIZ teslim (varsayılan) — tamamlanan mesaj anında yukarı çıkar,
 //     öndeki kayıp arkadakini BEKLETMEZ (head-of-line blocking yok)
 //   • Sıralı teslim (`ordered:true`) — akış (streamId) başına sıra korunur
@@ -29,7 +30,7 @@
 //   PONG 0x04 | token(4)
 
 const { EventEmitter } = require('node:events');
-const { LossRecovery } = require('./recovery.js');
+const { LossRecovery, DEFAULT_CONGESTION_CONTROL } = require('./recovery.js');
 
 const FRAME = Object.freeze({ RAW: 0x00, DATA: 0x01, ACK: 0x02, PING: 0x03, PONG: 0x04 });
 const DATA_HEADER_LEN = 18;
@@ -52,7 +53,16 @@ const DEFAULTS = Object.freeze({
   maxOrderedBuffer: 128,   // sıralı modda bekletilecek mesaj sayısı
   maxDedupeEntries: 8192,  // teslim edilmiş mesaj kimlikleri (yineleme eleme)
   maxAckRanges: 32,
+  /** 'bbr3' | 'newreno' — gerekçeler reliable/congestion.js başında. */
+  congestionControl: DEFAULT_CONGESTION_CONTROL,
+  /** Hız şekillendirme; verilmezse denetleyici karar verir (BBR: açık). */
+  pacing: undefined,
+  /** BBR ince ayarları (congestion.js BBR_DEFAULTS). */
+  bbr: undefined,
 });
+
+/** Hız şekillendirici beklerken zamanlayıcının aşmayacağı süre. */
+const MAX_PACING_TIMER_MS = 250;
 
 // Alıcı, iki ACK bekleyen paketten sonra ACK'i geciktirmeden gönderir
 // (RFC 9000 §13.2.1) — kurtarma turunu kısaltan en ucuz iyileştirme.
@@ -84,6 +94,9 @@ class ReliableChannel extends EventEmitter {
       initialRtt: this.opts.initialRtt,
       minPto: this.opts.minPto,
       maxPto: this.opts.maxPto,
+      congestionControl: this.opts.congestionControl,
+      pacing: this.opts.pacing,
+      bbr: this.opts.bbr,
     });
 
     // --- gönderici durumu
@@ -95,6 +108,7 @@ class ReliableChannel extends EventEmitter {
     this.queued = new Set();         // sendQueue üyelik indeksi (O(1) sorgu)
     this.timer = null;
     this.timerAt = 0;
+    this.pacingTimer = null;
 
     // --- alıcı durumu
     this.ackRanges = [];             // [[start,end], ...] artan, birleştirilmiş
@@ -115,6 +129,10 @@ class ReliableChannel extends EventEmitter {
   get inFlight() { return this.recovery.sent.size; }
   get rttMs() { return this.recovery.hasRttSample ? Math.round(this.recovery.smoothedRtt) : null; }
   get congestionWindow() { return this.recovery.congestionWindow; }
+  /** Hedef gönderim hızı (bayt/s) — şekillendirme kapalıysa null. */
+  get pacingRate() { return this.recovery.pacingRate; }
+  /** Yürürlükteki tıkanıklık denetleyicisinin adı. */
+  get congestionControl() { return this.recovery.congestionControl; }
 
   /** Ayrıntılı kurtarma/tıkanıklık durumu — teşhis ve ölçüm için. */
   getStats() {
@@ -191,25 +209,48 @@ class ReliableChannel extends EventEmitter {
   }
 
   /**
-   * Kuyruğu tıkanıklık penceresi izin verdiği ölçüde boşaltır.
-   * RFC 9002 §7: pencere dolduğunda gönderim DURUR; zamanla ACK geldikçe
-   * (veya PTO sondası ilerlettikçe) yeniden akmaya başlar.
+   * Kuyruğu tıkanıklık penceresinin VE hız şekillendiricinin izin verdiği
+   * ölçüde boşaltır.
+   *
+   * İki ayrı fren vardır ve karıştırılmamalıdır:
+   *   • pencere dolu   → ACK beklenir; zamanlayıcı kurulmaz, ACK yeniden pompalar
+   *   • hız sınırı     → zaman beklenir; kısa bir zamanlayıcı kurulur
+   * İkincisini de "ACK'i bekle" diye ele almak, hattı gereksiz yere boş
+   * bırakır: gönderecek veri var, pencere de müsait, yalnızca sıra gelmemiş.
    */
   _pump() {
     if (this.closed) return;
+    const now = Date.now();
+
     while (this.sendQueue.length) {
       const key = this.sendQueue[0];
       const chunk = this.chunks.get(key);
       if (!chunk) { this._dequeue(); continue; }
 
       const size = DATA_HEADER_LEN + chunk.payload.length;
-      if (!this.recovery.canSend(size)) break;
+      if (!this.recovery.hasCongestionRoom(size)) break;
       if (this.recovery.sent.size >= this.opts.maxTrackedPackets) break;
+
+      const wait = this.recovery.pacingDelay(size, now);
+      if (wait > 0) { this._armPacingTimer(wait); break; }
 
       this._dequeue();
       this._transmit(chunk);
     }
+
+    // Kuyruk boşaldı: bundan sonraki teslim hızı örnekleri AĞIN değil
+    // uygulamanın hızını ölçer. İşaretlenmezse BBR, veri veremediğimiz için
+    // boş kalan hattı yavaş bir hat sanar ve tahmini kalıcı olarak düşer.
+    if (this.sendQueue.length === 0) this.recovery.markAppLimited();
+
     this._rearmTimer();
+  }
+
+  _armPacingTimer(ms) {
+    if (this.pacingTimer || this.closed) return;
+    const delay = Math.max(1, Math.min(Math.ceil(ms), MAX_PACING_TIMER_MS));
+    this.pacingTimer = setTimeout(() => { this.pacingTimer = null; this._pump(); }, delay);
+    if (this.pacingTimer.unref) this.pacingTimer.unref();
   }
 
   _dequeue() {
@@ -593,6 +634,7 @@ class ReliableChannel extends EventEmitter {
     this.closed = true;
     this._clearTimer();
     if (this.ackTimer) { clearTimeout(this.ackTimer); this.ackTimer = null; }
+    if (this.pacingTimer) { clearTimeout(this.pacingTimer); this.pacingTimer = null; }
 
     const e = err || new Error('kanal kapandı');
     for (const [msgKey, record] of this.messages) {

@@ -54,6 +54,7 @@ class MemoryStore {
     this.apps = new Map();
     this.sessions = new Map();
     this.reservations = new Map();
+    this.blocklist = new Map();
     this.events = [];
     this.metrics = [];
   }
@@ -94,6 +95,10 @@ class MemoryStore {
 
   async saveReservation(row) { this.reservations.set(row.key, { ...row }); }
   async listReservations() { return [...this.reservations.values()]; }
+
+  async saveBlock(row) { this.blocklist.set(row.address, { ...row }); return row; }
+  async deleteBlock(address) { return this.blocklist.delete(address); }
+  async listBlocks() { return [...this.blocklist.values()]; }
 
   async recordEvent(row) {
     this.events.push(row);
@@ -367,6 +372,33 @@ class DatabaseStore {
       acquiredAt: num(r.acquiredAt),
       releasedAt: num(r.releasedAt),
       state: r.state,
+    }));
+  }
+
+  // ---- engel listesi ------------------------------------------------------
+  async saveBlock(row) {
+    await this._upsert('tunnel_blocklist', 'address', row.address, {
+      reason: String(row.reason || '').slice(0, 200),
+      actor: String(row.actor || '').slice(0, 128),
+      at: big(row.at || Date.now()),
+      expiresAt: big(row.expiresAt || 0),
+    });
+    return row;
+  }
+
+  async deleteBlock(address) {
+    const rows = await this._findAll('tunnel_blocklist', 'address', address);
+    for (const row of rows) await this._c('tunnel_blocklist').delete(row._id);
+    return rows.length > 0;
+  }
+
+  async listBlocks() {
+    return (await this._scanAll('tunnel_blocklist')).map((r) => ({
+      address: r.address,
+      reason: r.reason,
+      actor: r.actor,
+      at: num(r.at),
+      expiresAt: num(r.expiresAt),
     }));
   }
 

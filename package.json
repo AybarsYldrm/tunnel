@@ -28,6 +28,7 @@
     "test:mtls": "node tests/test-mtls.js",
     "test:srtp": "node tests/test-srtp.js",
     "test:reliable": "node tests/test-reliable.js",
+    "test:bbr": "node tests/test-bbr.js",
     "test:robust": "node tests/test-robustness.js",
     "test:retransmit": "node tests/test-retransmit.js",
     "certs": "bash scripts/gen-certs.sh",

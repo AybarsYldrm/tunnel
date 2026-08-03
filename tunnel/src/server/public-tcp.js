@@ -72,15 +72,32 @@ class PublicTcpEndpoint {
       return;
     }
 
+    // Ziyaretçi defteri: panelin "kim bağlı, gecikmesi ne" sorusuna
+    // cevabı buradan doğar. Kapatma işlevi (kick) soketin kendisidir —
+    // defter, bağlantıyı nasıl kapatacağını bilmek zorunda değil.
+    const peer = this.tunnel.server.peers.open({
+      appId: this.app.appId,
+      appName: this.app.name,
+      protocol: 'tcp',
+      publicPort: this.port,
+      tunnelId: this.tunnel.tunnelId,
+      tunnelName: this.tunnel.displayName,
+      address: ip,
+      port: socket.remotePort || 0,
+      kick: () => socket.destroy(),
+    });
+
     const stream = this.tunnel.openPublicConnection(this.app, {
       remoteAddress: ip,
       remotePort: socket.remotePort || 0,
       socket,
+      peer,
     });
 
     if (!stream) {
       this.refused++;
       this.guard.noteClose(ip, this.app.appId);
+      this.tunnel.server.peers.close(peer);
       socket.destroy();
       return;
     }
@@ -93,7 +110,10 @@ class PublicTcpEndpoint {
     // protokoller). Yalnızca istemciyi beklemek onları kırardı.
     const cancel = this.guard.armFirstByte(socket, ip);
     stream.once('data', cancel);
-    stream.once('close', () => this.guard.noteClose(ip, this.app.appId));
+    stream.once('close', () => {
+      this.guard.noteClose(ip, this.app.appId);
+      this.tunnel.server.peers.close(peer);
+    });
 
     socket.resume();
   }

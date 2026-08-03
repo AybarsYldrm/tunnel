@@ -25,6 +25,7 @@ const { TIMING } = require('../protocol/constants.js');
 const { Tunnel } = require('./tunnel.js');
 const { PortAllocator } = require('./ports.js');
 const { Guard } = require('./guard.js');
+const { PeerRegistry } = require('./peers.js');
 const { createStore } = require('./store.js');
 const { normalizeApp, appToPublic, invalid } = require('./app-model.js');
 const { loadServerConfig } = require('./config.js');
@@ -43,6 +44,10 @@ class TunnelServer extends EventEmitter {
       log: this.log.child('ports'),
     });
     this.guard = new Guard(config.guard, this.log.child('guard'));
+    this.peers = new PeerRegistry({
+      log: this.log.child('peers'),
+      maxPeers: config.guard.maxConnectionsGlobal * 2,
+    });
 
     this.store = null;
     this.dtls = null;
@@ -64,6 +69,13 @@ class TunnelServer extends EventEmitter {
     this.startedAt = Date.now();
     this.store = await createStore({ config: this.options.db, log: this.log.child('store') });
 
+    // Elle konan engeller yeniden başlatmayı atlatmalı: bir yöneticinin
+    // "bu adres giremez" kararının, sunucu güncellemesiyle sessizce
+    // kaybolması kabul edilemez.
+    const blocks = await this.store.listBlocks().catch(() => []);
+    const restored = this.guard.loadBlocks(blocks);
+    if (restored) this.log.info('engel listesi yüklendi', { adres: restored });
+
     const secure = await this._loadCredentials();
 
     this.dtls = dtls.createServer({
@@ -80,12 +92,17 @@ class TunnelServer extends EventEmitter {
       revocation: this.options.revocation,
 
       mtu: this.options.mtu,
+      // Şifreleme paketi tercihi: politika adı ('balanced', 'chacha20', ...)
+      // ya da açık suite listesi. Sunucunun sırası bağlayıcıdır.
+      cipherSuites: this.options.cipher,
       reliable: {
         // Sıra kararı akış BAŞINA veriliyor (mux her gönderimde açıkça
         // belirtiyor), kanal genelinde değil.
         ordered: false,
         maxTrackedPackets: 8192,
         maxRetransmits: 15,
+        // Tıkanıklık denetimi — varsayılan BBRv3.
+        congestionControl: this.options.congestionControl,
       },
 
       // DTLS seviyesinde DoS: cookie takası (varsayılan açık) el sıkışma
@@ -119,7 +136,10 @@ class TunnelServer extends EventEmitter {
       genelHavuz: `${this.options.portMin}-${this.options.portMax}`,
       genelAdres: this.options.publicHost,
       iptalDenetimi: this.options.revocation,
+      sifreleme: this.options.cipher,
+      tikaniklik: this.options.congestionControl,
       kalicilik: this.store.mode,
+      yapilandirma: this.options.configFile || 'ortam değişkenleri',
     });
 
     if (this.options.admin.enabled) {
@@ -264,6 +284,9 @@ class TunnelServer extends EventEmitter {
   async _onTunnelClosed(tunnel, reason) {
     this.tunnels.delete(tunnel.tunnelId);
     if (this.byClient.get(tunnel.clientId) === tunnel) this.byClient.delete(tunnel.clientId);
+    // Tünel gitti: arkasındaki dinleyiciler kapandı, dolayısıyla o tünele ait
+    // ziyaretçi kayıtları da artık canlı değil.
+    this.peers.dropTunnel(tunnel.tunnelId);
 
     const snap = tunnel.mux.snapshot();
     await this.store.endSession(tunnel.tunnelId, {
@@ -388,6 +411,52 @@ class TunnelServer extends EventEmitter {
     return { closed: true };
   }
 
+  // ---- ziyaretçiler (genel yüzeye dışarıdan bağlananlar) ------------------
+
+  /** Tek bir dış bağlantıyı kapatır. Adres engellenmez — bu bir "at", "yasakla" değil. */
+  async kickPeer(peerId, { actor }) {
+    const peer = this.peers.get(peerId);
+    if (!peer) throw Object.assign(new Error('bağlantı bulunamadı'), { status: 404, code: 'not_found' });
+    const info = peer.toJSON();
+    this.peers.kick(peerId);
+    await this.store.recordEvent({
+      kind: 'peer.kick',
+      actor,
+      subject: `${info.address}:${info.port}`,
+      detail: JSON.stringify({ app: info.appName, publicPort: info.publicPort }),
+      at: Date.now(),
+    }).catch(() => {});
+    return { kicked: true, peer: info };
+  }
+
+  /**
+   * Bir kaynak adresi genel yüzeyden engeller ve o adrese ait açık bağlantıları
+   * kapatır. Engellemek ama açık bağlantıyı bırakmak, engeli bir sonraki
+   * bağlantıya kadar etkisiz kılardı.
+   */
+  async blockAddress(address, { ttlMs = 0, reason = '', actor }) {
+    const record = this.guard.blockAddress(address, { ttlMs, reason, actor });
+    const dropped = this.peers.kickAddress(record.address);
+    await this.store.saveBlock(record).catch((e) => this.log.warn('engel kaydedilemedi', { err: e.message }));
+    await this.store.recordEvent({
+      kind: 'peer.block',
+      actor,
+      subject: record.address,
+      detail: JSON.stringify({ reason: record.reason, ttlMs, dropped }),
+      at: Date.now(),
+    }).catch(() => {});
+    return { ...record, droppedConnections: dropped };
+  }
+
+  async unblockAddress(address, { actor }) {
+    const removed = this.guard.unblockAddress(address);
+    await this.store.deleteBlock(address).catch(() => {});
+    await this.store.recordEvent({
+      kind: 'peer.unblock', actor, subject: address, detail: '', at: Date.now(),
+    }).catch(() => {});
+    return { address, blocked: false, removed };
+  }
+
   async setClientBlocked(clientId, blocked, { actor }) {
     await this.store.upsertClient({ clientId, blocked });
     const tunnel = this.byClient.get(clientId);
@@ -409,6 +478,7 @@ class TunnelServer extends EventEmitter {
     let boundApps = 0;
     let rttSum = 0;
     let rttN = 0;
+    let congestionControl = null;
 
     for (const t of tunnels) {
       const s = t.mux.snapshot();
@@ -418,7 +488,9 @@ class TunnelServer extends EventEmitter {
       apps += t.apps.size;
       for (const a of t.apps.values()) if (a.boundPort) boundApps++;
       if (s.rttMs != null) { rttSum += s.rttMs; rttN++; }
+      if (!congestionControl && s.congestionControl) congestionControl = s.congestionControl;
     }
+    const peerStats = this.peers.snapshot();
 
     return {
       startedAt: this.startedAt,
@@ -435,7 +507,16 @@ class TunnelServer extends EventEmitter {
       traffic: {
         bytesIn, bytesOut, rateIn, rateOut,
       },
-      link: { avgRttMs: rttN ? Math.round(rttSum / rttN) : null },
+      link: {
+        avgRttMs: rttN ? Math.round(rttSum / rttN) : null,
+        congestionControl,
+      },
+      peers: {
+        active: peerStats.active,
+        total: peerStats.total,
+        blocked: this.guard.blocks.size,
+        avgRttMs: peerStats.avgRttMs,
+      },
       ports: this.ports.stats(),
       guard: this.guard.snapshot(),
       listener: this.dtls ? this.dtls.address() : null,

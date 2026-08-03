@@ -810,6 +810,12 @@ class Mux extends EventEmitter {
       /** RFC 9002 yumuşatılmış RTT — saf ağ gecikmesi. */
       rttMs: channel && channel.smoothedRtt ? Math.round(channel.smoothedRtt) : null,
       minRttMs: channel && channel.minRtt != null ? Math.round(channel.minRtt) : null,
+      /** Yürürlükteki tıkanıklık denetleyicisi ve modelinin durumu. */
+      congestionControl: channel ? channel.cc : null,
+      ccState: channel ? channel.state : null,
+      /** BBR'ın ölçtüğü darboğaz bant genişliği (bayt/s) — NewReno'da null. */
+      bandwidthBps: channel ? (channel.bandwidthBps || null) : null,
+      pacingRateBps: channel ? (channel.pacingRateBps || null) : null,
       congestionWindow: channel ? channel.congestionWindow : null,
       bytesInFlight: channel ? channel.bytesInFlight : null,
       packetsLost: channel ? channel.packetsLost : null,

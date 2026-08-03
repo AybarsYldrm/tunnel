@@ -141,3 +141,16 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Yerel tünel yapılandırması — SIR İÇERİR (OAuth secret, veritabanı anahtarı).
+# Şablon `tunnel/config.example.js` olarak sürüm kontrolünde tutulur.
+#
+# Yollar KÖKE SABİTLENMİŞ (baştaki /). Sabitlemeden yazılan `config.js`, adı
+# config.js olan HER dosyayı — src/server/config.js dahil — kapsardı.
+/config.js
+/config.json
+/tunnel/config.js
+/tunnel/config.json
+
+# Test PKI'sı — `npm run certs` ile üretilir, ÖZEL ANAHTAR içerir.
+/certs/

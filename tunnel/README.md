@@ -112,6 +112,40 @@ npx fitfak-tunnel \
 Alınan sertifika `~/.fitfak-tunnel/` altına yazılır (0600); sonraki
 çalıştırmalarda giriş sorulmaz ve ömrünün 2/3'ünde kendiliğinden yenilenir.
 
+#### Taşıma ayarı
+
+```bash
+fitfak-tunnel --server tunnel.fitfak.net:4443 \
+  --cipher chacha20 \      # AES hızlandırması olmayan uçlarda kat kat hızlı
+  --cc bbr3 \              # varsayılan; 'newreno' de seçilebilir
+  --mtu 1200                # IPv6 asgari MTU'suna göre güvenli değer
+```
+
+`--print-config` çözümlenmiş yapılandırmayı yazar ve çıkar — "neden benim
+ayarım tutmuyor" sorusunu tek komutla bitirir. Öncelik sırası her zaman
+**komut satırı > ortam değişkeni > varsayılan**.
+
+#### Servis/otomasyon altında çalıştırma
+
+İlk çalıştırmada kimlik yoksa tarayıcı akışı başlar. Bu, insan kullanımı için
+doğru varsayılan ama bir servisin altında süreç sessizce asılı kalır ve
+yeniden başlatma döngüsüne girer. `--no-enroll` bunu açık bir hataya çevirir:
+
+```bash
+fitfak-tunnel --server ... --no-enroll --quiet --json
+```
+
+| Çıkış kodu | Anlamı |
+|---|---|
+| `0` | Düzgün kapanış |
+| `1` | Çalışma zamanı hatası (bağlanılamadı, sertifika geçersiz…) |
+| `2` | Kullanım hatası (eksik/geçersiz seçenek) |
+| `3` | Kimlik yok ve `--no-enroll` verildi |
+
+`--json` her olayı satır başına bir JSON nesnesi olarak yazar
+(`{"event":"ready",...}`, `{"event":"bound",...}`); günlük toplayıcıya doğrudan
+verilebilir.
+
 ### Kütüphane olarak
 
 ```js
@@ -271,8 +305,10 @@ birisi işten ayrıldığında unutulacak ayrı bir iptal noktası demek olurdu.
 Panelde görülen ve ayarlanabilenler:
 
 - **Tüneller** — sertifika konusu/seri/geçerlilik, iptal denetimi sonucu, RTT
-  (ağ ve uygulama ayrı), tıkanıklık penceresi, kayıp oranı, yeniden gönderim,
-  anlık ve toplam bant genişliği, açık akış sayısı
+  (ağ ve uygulama ayrı), tıkanıklık denetleyicisi ve model durumu, ölçülen
+  bant genişliği, hedef gönderim hızı, tıkanıklık penceresi, kayıp oranı,
+  yeniden gönderim, anlık ve toplam bant genişliği, açık akış sayısı
+- **Ziyaretçiler** — genel portlara **dışarıdan** bağlanan uçlar (aşağıda)
 - **Uygulamalar** — yerel hedef (`127.0.0.2:8080`), genel port (otomatik ya da
   sabit), TCP/UDP, **kayıpsız / kayıp toleranslı teslim**, yön başına Mbit/s
   sınırı, eşzamanlı bağlantı tavanı, port sabitleme
@@ -280,13 +316,82 @@ Panelde görülen ve ayarlanabilenler:
 - **Koruma** — düşürülen trafik, yasaklı kaynaklar, yürürlükteki sınırlar
 - **Denetim kaydı** — kim, ne zaman, neyi değiştirdi
 
-Sayfa satır içi script/style kullanmaz (`script-src 'self'`), tüm dinamik metin
-`textContent` ile yazılır: bu sayfadaki verilerin çoğu tünel istemcilerinden
-gelir ve ham `innerHTML`'e konsaydı istemci olan herkes panelde kod
-çalıştırabilirdi.
+### Ziyaretçiler — kim bağlı, gecikmesi ne, nasıl atılır
 
-REST API: `/api/overview`, `/api/tunnels`, `/api/clients`, `/api/apps`,
-`/api/ports`, `/api/guard`, `/api/events`, `/api/metrics`, `/api/stream` (SSE).
+Tünelin iki ayrı "istemci" kavramı var ve karıştırılmaları pahalıya patlar:
+
+| | **İstemci** (client) | **Ziyaretçi** (peer) |
+|---|---|---|
+| Kim | Tüneli kuran taraf | Yayınlanmış bir genel porta (örn. `25565`) dışarıdan bağlanan |
+| Kimlik | Sertifika (kriptografik) | Yalnızca IP adresi |
+| Engellemek | Kalıcı yetki kararı | Genel yüzeyden dışlama |
+
+Ziyaretçi listesi her açık dış bağlantı için kaynak adres/port, hangi uygulama
+ve genel port, süre, taşınan bayt ve **gecikme** gösterir. Her satırda iki
+işlem var: **At** (yalnızca o bağlantıyı kapatır) ve **Engelle** (adresi
+listeye alır ve o adrese ait tüm açık bağlantıları düşürür).
+
+Engel listesi otomatik yasaklardan **ayrı** tutulur ve diske yazılır. Otomatik
+yasak bir hız sınırı tepkisidir: saniyeler içinde doğar, üstel büyür ve
+kendiliğinden sönümlenir. Elle konan engel bir **karardır** ve yalnızca yine
+elle kalkar — aynı tabloda tutulsalardı temizlik döngüsü yöneticinin kararını
+sessizce silerdi. Süreli engel de verilebilir (`ttlMs`).
+
+> **Gecikme "ping" değildir.** Ziyaretçiye ICMP echo atmak ham soket (root)
+> ister ve pek çok ağ onu düşürür; TCP'nin çekirdekteki RTT tahmini Node'dan
+> görünmez; uygulama protokolünü bilmediğimiz için protokole özgü bir yankı
+> paketi de üretemeyiz. Ölçülen şey **tur süresidir**: ziyaretçiye son baytı
+> yazdığımız an ile ondan gelen bir sonraki bayt arasındaki fark. Tek bir örnek
+> `ağ gecikmesi + karşı tarafın düşünme süresi` toplamıdır ve işe yaramaz — ama
+> kayan pencereli **minimum** alındığında düşünme süresi terimi sıfıra
+> yaklaşır: sürekli konuşan bir protokolde (oyun istemcisi, SSH, HTTP
+> keep-alive) er ya da geç hemen yanıtlanan bir tur olur. Panel bu yüzden ölçüm
+> sayısını da gösterir; iki örnekten çıkan bir sayıya güvenilmemeli.
+
+### İçerik güvenliği politikası
+
+Politika `default-src 'none'` ile başlar ve tek tek açılır. Panelde **tek bir**
+satır içi `style="..."` özniteliği ya da gövdeli script etiketi yoktur; dinamik
+ölçüler (sparkline genişlikleri) CSS özel özelliği olarak, CSSOM üzerinden
+atanır — o yol CSP'nin `style-src` kapsamı dışındadır, satır içi öznitelik ise
+kapsam içindedir. Konsol hiçbir yerde `innerHTML` kullanmaz; her metin
+`textContent` ile yazılır.
+
+Bu uyum sayesinde `require-trusted-types-for 'script'` açılabiliyor: tarayıcı
+artık `innerHTML`'e yazmayı **kendisi** engelliyor, yani kural gelecekte
+yanlışlıkla bile ihlal edilemiyor.
+
+Üçüncü taraf betikler varsayılan olarak **engellidir**. Paneli Cloudflare'in
+arkasına koyduysanız `beacon.min.js` engellenir (konsoldaki *"Loading the script
+… violates CSP"* hatası budur). Açmak isterseniz:
+
+```js
+admin: { csp: { cloudflareInsights: true } }   // ya da başka kökenler için:
+admin: { csp: { scriptSrc: ['https://cdn.example.com'] } }
+```
+
+Bu, **tek bir kökene** izin verir; `'unsafe-inline'` açmaz. Zaten açılamaz da:
+yapılandırmaya `'unsafe-inline'` / `'unsafe-eval'` yazılsa bile süzülür —
+elimizdeki tek gerçek XSS bariyerini bir yazım hatasına bağlamak istemiyoruz.
+
+Gönderilen diğer başlıklar: `Permissions-Policy` (tüm güçlü özellikler kapalı),
+`Cross-Origin-Opener/Resource/Embedder-Policy`, `X-Frame-Options: DENY`,
+`X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`.
+
+### REST API
+
+`/api/overview`, `/api/tunnels`, `/api/clients`, `/api/apps`, `/api/ports`,
+`/api/guard`, `/api/events`, `/api/metrics`, `/api/stream` (SSE)
+
+Ziyaretçi ve engel uçları:
+
+| Uç | Yöntem | Ne yapar |
+|---|---|---|
+| `/api/peers` | GET | Açık dış bağlantılar (`?appId=`, `?address=` ile süzülür) |
+| `/api/peers/:id/kick` | POST | Tek bir bağlantıyı kapatır — adres engellenmez |
+| `/api/blocklist` | GET | Engelli adresler |
+| `/api/blocklist` | POST | `{ address, ttlMs, reason }` — 0 = kalıcı |
+| `/api/blocklist/:address` | DELETE | Engeli kaldırır |
 
 ---
 
@@ -297,7 +402,12 @@ desenle çözülür: bootstrap TLS → güven çıpaları → enrolment → mTLS
 yenileme (RFC 7030/EST semantiği).
 
 Koleksiyonlar: `tunnel_clients`, `tunnel_apps`, `tunnel_sessions`,
-`tunnel_reservations`, `tunnel_events`, `tunnel_metrics`.
+`tunnel_reservations`, `tunnel_events`, `tunnel_metrics`, `tunnel_blocklist`.
+
+`tunnel_blocklist` yalnızca **elle konan** engelleri taşır. Otomatik yasaklar
+diske yazılmaz ve bu bilinçli: saniyeler içinde doğup sönümlenen binlerce kaydı
+kalıcılaştırmak, bir sel altında veritabanını saldırının kendisi hâline
+getirirdi.
 
 İndeks seçimi neyin sızdığını belirliyor: aranabilir olması gereken alanlar
 (`clientId`, `appId`) **körlemesine** indeksli, gezilebilir olması gerekenler
@@ -312,7 +422,27 @@ yoktur ve açılışta bu yüksek sesle söylenir.
 
 ## Yapılandırma
 
-Tamamı ortam değişkeni; ayrıntısı `src/server/config.js`'te.
+Üç katman, net bir öncelik sırasıyla (sonraki öncekini ezer):
+
+1. koddaki varsayılanlar
+2. **ortam değişkenleri** — kapsayıcı/systemd dünyasının dili
+3. **yapılandırma dosyası** — elle yönetilen kurulumlar için
+
+Dosya neden ortamın üstünde? Dosyayı yazan kişi onu bilerek yazmıştır; ortam
+değişkeni ise kabuktan, kapsayıcı imajından ya da CI'dan sızmış olabilir.
+"Dosyada ne yazıyorsa o çalışır" teşhis edilebilir tek davranıştır.
+
+```bash
+cp tunnel/config.example.js tunnel/config.js   # sonra düzenleyin
+# ya da başka bir yol:
+FITFAK_TUNNEL_CONFIG=/etc/fitfak/tunnel.js node tunnel/bin/fitfak-tunneld.js
+```
+
+Dosya kısmi olabilir — yalnızca değiştirmek istediğiniz alanları yazın. `chmod
+600` verin: OAuth `clientSecret` ve veritabanı anahtarı orada duruyor.
+`tunnel/config.js` sürüm kontrolünde **yok sayılır**.
+
+Ortam değişkenlerinin tamamı; ayrıntısı `src/server/config.js`'te.
 
 | Değişken | Varsayılan | Ne yapar |
 |---|---|---|
@@ -322,6 +452,10 @@ Tamamı ortam değişkeni; ayrıntısı `src/server/config.js`'te.
 | `FITFAK_TUNNEL_ROOT_CA_URL` | `http://status.trust.fitfak.net/root.crt` | Kök yayın adresi |
 | `FITFAK_TUNNEL_ROOT_CA_FINGERPRINT` | — | **sabitleyin** |
 | `FITFAK_TUNNEL_REVOCATION` | `hard-fail` | `off` \| `soft-fail` \| `hard-fail` |
+| `FITFAK_TUNNEL_CIPHER` | `balanced` | `balanced` \| `aes128` \| `aes256` \| `aes` \| `chacha20` \| `mobile` |
+| `FITFAK_TUNNEL_CONGESTION_CONTROL` | `bbr3` | `bbr3` \| `newreno` — tıkanıklık denetimi |
+| `FITFAK_TUNNEL_MTU` | `1200` | Datagram yükü tavanı |
+| `FITFAK_TUNNEL_CONFIG` | — | Yapılandırma dosyası yolu |
 | `FITFAK_TUNNEL_PUBLIC_HOST` / `_HOSTNAME` | `0.0.0.0` / — | Bağlama adresi / gösterilen ad |
 | `FITFAK_TUNNEL_PORT_MIN` / `_MAX` | `20000` / `30000` | Genel port havuzu |
 | `FITFAK_TUNNEL_PORT_LINGER_MS` | `20000` | Kopmadan sonra portu tutma süresi |
@@ -330,6 +464,9 @@ Tamamı ortam değişkeni; ayrıntısı `src/server/config.js`'te.
 | `FITFAK_TUNNEL_ADMIN_HOST` / `_PORT` | `127.0.1.3` / `80` | Yönetim yüzeyi |
 | `FITFAK_TUNNEL_OAUTH_CLIENT_ID` / `_SECRET` / `_REDIRECT_URI` | — | **zorunlu** (yönetim açıkken) |
 | `FITFAK_TUNNEL_ADMIN_EMAIL` | — | İkinci kabul yolu |
+| `FITFAK_TUNNEL_ADMIN_CSP_CLOUDFLARE` | `0` | Cloudflare beacon'ına izin ver |
+| `FITFAK_TUNNEL_ADMIN_CSP_SCRIPT_SRC` | — | Ek betik kökenleri (boşlukla ayrık) |
+| `FITFAK_TUNNEL_ADMIN_CSP_TRUSTED_TYPES` | `1` | Trusted Types zorunluluğu |
 | `FITFAK_TUNNEL_DB_TARGET` | — | Verilmezse bellek-içi |
 | `FITFAK_TUNNEL_SEGMENT_BYTES` | `16384` | DRR segment boyutu |
 | `FITFAK_TUNNEL_STREAM_WINDOW` | `262144` | Akış başına pencere |

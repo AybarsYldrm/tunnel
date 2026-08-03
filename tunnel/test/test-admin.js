@@ -16,6 +16,7 @@ const os = require('node:os');
 const { Runner } = require('../../tests/helpers.js');
 const { TunnelServer } = require('../src/server/index.js');
 const { loadServerConfig } = require('../src/server/config.js');
+const { buildCsp } = require('../src/server/admin/server.js');
 
 const CERTS = path.join(__dirname, '..', '..', 'certs');
 
@@ -173,6 +174,9 @@ async function startStack({ adminOverrides = {}, user } = {}) {
   await new Promise((res) => probe.close(res));
 
   const config = loadServerConfig({
+    // Testler hermetik olmalı: geliştiricinin makinesindeki bir config.js
+    // testin sonucunu değiştirmemeli.
+    configFile: false,
     host: '127.0.0.1',
     port: 0,
     publicHost: '127.0.0.1',
@@ -435,6 +439,191 @@ async function startStack({ adminOverrides = {}, user } = {}) {
       // Dizin dışına çıkma denemesi.
       const escape = await b.get('/api/../../../etc/passwd', { follow: false });
       assert.ok(escape.status === 404 || escape.status === 401 || escape.status === 302);
+    } finally { await s.close(); }
+  });
+
+  // =========================================================================
+  // İçerik güvenliği politikası
+  // =========================================================================
+  await r.test('CSP: politika sıkı ve panel ona GERÇEKTEN uyuyor', async () => {
+    const s = await startStack({
+      user: {
+        sub: 'u10', preferred_username: 'admin', email: 'a@fitfak.net', email_verified: true, role: 'admin',
+      },
+    });
+    try {
+      const b = s.browser();
+      await b.get('/login');
+      const page = await b.get('/');
+      const csp = page.headers['content-security-policy'];
+
+      for (const directive of [
+        "default-src 'none'", "script-src 'self'", "style-src 'self'",
+        "object-src 'none'", "base-uri 'none'", "frame-ancestors 'none'",
+        "form-action 'self'", "require-trusted-types-for 'script'",
+      ]) {
+        assert.ok(csp.includes(directive), `politikada eksik: ${directive}`);
+      }
+      // Bu ikisi politikayı anlamsız kılar; hiçbir koşulda bulunmamalı.
+      assert.ok(!/unsafe-inline/.test(csp), "'unsafe-inline' asla olmamalı");
+      assert.ok(!/unsafe-eval/.test(csp), "'unsafe-eval' asla olmamalı");
+
+      // Ek başlıklar.
+      assert.strictEqual(page.headers['cross-origin-opener-policy'], 'same-origin');
+      assert.strictEqual(page.headers['cross-origin-resource-policy'], 'same-origin');
+      assert.strictEqual(page.headers['referrer-policy'], 'no-referrer');
+      assert.match(page.headers['permissions-policy'], /camera=\(\)/);
+
+      // --- Sayfanın politikaya UYDUĞU burada sabitleniyor.
+      // Politikayı yazmak kolay; ona uymak, her değişiklikte yeniden
+      // kazanılması gereken bir şey. Bu üç iddia tam olarak onu koruyor.
+      assert.ok(!/\sstyle\s*=\s*["']/.test(page.text),
+                'HTML\'de satır içi style özniteliği olmamalı');
+
+      const js = (await b.get('/tunnel-console.js')).text;
+      assert.ok(!/\.innerHTML\s*=/.test(js),
+                'konsol innerHTML\'e yazmamalı (Trusted Types bunu zaten engeller)');
+      assert.ok(!/\bdocument\.write\b|\binsertAdjacentHTML\b|\bouterHTML\s*=/.test(js),
+                'konsol başka bir HTML ayrıştırma yolu da kullanmamalı');
+      assert.ok(!/\bnew Function\b|[^.\w]eval\s*\(/.test(js),
+                'konsol dizeden kod üretmemeli');
+
+      const css = (await b.get('/tunnel-ui.css')).text;
+      assert.ok(css.includes('--spark-fill'),
+                'dinamik genişlik CSS değişkeniyle verilmeli');
+    } finally { await s.close(); }
+  });
+
+  await r.test('CSP: üçüncü taraf betiğe yalnızca açıkça izin verilir', async () => {
+    // Varsayılan: Cloudflare beacon ENGELLİ.
+    assert.ok(!buildCsp().includes('cloudflareinsights'));
+
+    // Açıkça istendiğinde: tek bir köken, ada göre listelenir.
+    const withCf = buildCsp({ cloudflareInsights: true });
+    assert.ok(withCf.includes('https://static.cloudflareinsights.com'),
+              'beacon kaynağı script-src\'ye eklenmeli');
+    assert.ok(withCf.includes('https://cloudflareinsights.com'),
+              'beacon\'ın ölçüm gönderdiği köken connect-src\'ye eklenmeli');
+    assert.ok(!/unsafe-inline/.test(withCf),
+              'üçüncü taraf betik için satır içi kod açılmamalı');
+
+    // Yapılandırma 'unsafe-*' AÇAMAZ: politikayı bir yazım hatasıyla
+    // çökertmek mümkün olmamalı.
+    const attempted = buildCsp({ scriptSrc: ["'unsafe-inline'", "'unsafe-eval'", 'https://cdn.example.com'] });
+    assert.ok(!/unsafe-/.test(attempted), 'unsafe-* süzülmeli');
+    assert.ok(attempted.includes('https://cdn.example.com'), 'meşru köken eklenmeli');
+
+    // Trusted Types kapatılabilir olmalı (eski bir tarayıcı parkı için) ama
+    // varsayılan AÇIK.
+    assert.ok(buildCsp().includes("require-trusted-types-for 'script'"));
+    assert.ok(!buildCsp({ trustedTypes: false }).includes('require-trusted-types-for'));
+
+    assert.ok(buildCsp({ reportUri: '/csp-report' }).includes('report-uri /csp-report'));
+  });
+
+  // =========================================================================
+  // Ziyaretçiler ve engel listesi
+  // =========================================================================
+  await r.test('ziyaretçiler: dış bağlantı listelenir, atılır ve engellenir', async () => {
+    const s = await startStack({
+      user: {
+        sub: 'u11', preferred_username: 'admin', email: 'a@fitfak.net', email_verified: true, role: 'admin',
+      },
+    });
+    try {
+      const b = s.browser();
+      await b.get('/login');
+
+      // Başlangıçta boş ama uç ÇALIŞIYOR olmalı.
+      const empty = await b.get('/api/peers');
+      assert.strictEqual(empty.status, 200);
+      assert.deepStrictEqual(empty.json.peers, []);
+      assert.strictEqual(empty.json.stats.active, 0);
+
+      // Defteri doğrudan besleyip uçların davranışını sınıyoruz: gerçek bir
+      // dış bağlantı kurmak için ayrı bir tünel + istemci gerekir ve o yol
+      // test-tunnel.js'te zaten kapsanıyor.
+      let kicked = false;
+      const peer = s.server.peers.open({
+        appId: 'app1',
+        appName: 'minecraft',
+        protocol: 'tcp',
+        publicPort: 25565,
+        tunnelId: 't1',
+        tunnelName: 'ev-sunucusu',
+        address: '203.0.113.7',
+        port: 51234,
+        kick: () => { kicked = true; },
+      });
+      // Pasif gecikme ölçümü: önce biz yazdık, sonra o yanıtladı.
+      s.server.peers.noteOut(peer, 100, 1_000);
+      s.server.peers.noteIn(peer, 50, 1_042);
+      s.server.peers.noteOut(peer, 100, 2_000);
+      s.server.peers.noteIn(peer, 50, 2_030);
+
+      const list = await b.get('/api/peers');
+      assert.strictEqual(list.json.peers.length, 1);
+      const row = list.json.peers[0];
+      assert.strictEqual(row.address, '203.0.113.7');
+      assert.strictEqual(row.publicPort, 25565);
+      assert.strictEqual(row.appName, 'minecraft');
+      assert.strictEqual(row.rttMs, 30, 'örneklerin EN KÜÇÜĞÜ alınmalı (42 değil 30)');
+      assert.strictEqual(row.samples, 2);
+      assert.strictEqual(row.bytesOut, 200);
+      assert.strictEqual(row.bytesIn, 100);
+
+      // At: bağlantı kapanır, adres engellenmez.
+      const kickRes = await b.post(`/api/peers/${encodeURIComponent(row.id)}/kick`, {});
+      assert.strictEqual(kickRes.status, 200);
+      assert.strictEqual(kicked, true, 'kapatma işlevi çağrılmalı');
+      assert.strictEqual((await b.get('/api/peers')).json.peers.length, 0);
+      assert.strictEqual(s.server.guard.isBlocked('203.0.113.7'), false,
+                         'atmak engellemek DEĞİLDİR');
+
+      // Engelle: guard artık o adresi kabul etmemeli.
+      const blockRes = await b.post('/api/blocklist', {
+        address: '203.0.113.7', reason: 'kötüye kullanım', ttlMs: 0,
+      });
+      assert.strictEqual(blockRes.status, 200);
+      assert.strictEqual(s.server.guard.checkAccept('203.0.113.7', 'app1').ok, false);
+      assert.strictEqual(s.server.guard.checkAccept('203.0.113.8', 'app1').ok, true);
+      assert.strictEqual(s.server.guard.checkUdpInbound('203.0.113.7', 100, true).ok, false,
+                         'engel UDP tarafında da geçerli olmalı');
+
+      const blocklist = await b.get('/api/blocklist');
+      assert.strictEqual(blocklist.json.blocklist.length, 1);
+      assert.strictEqual(blocklist.json.blocklist[0].reason, 'kötüye kullanım');
+      assert.strictEqual(blocklist.json.blocklist[0].expiresAt, 0, '0 = kalıcı');
+      assert.match(blocklist.json.blocklist[0].actor, /admin/);
+
+      // Engel kalıcılığa yazılmalı: yeniden başlatma onu kaybetmemeli.
+      const stored = await s.server.store.listBlocks();
+      assert.strictEqual(stored.length, 1);
+      assert.strictEqual(stored[0].address, '203.0.113.7');
+
+      // Kaldır.
+      const un = await b.del('/api/blocklist/203.0.113.7');
+      assert.strictEqual(un.status, 200);
+      assert.strictEqual(s.server.guard.isBlocked('203.0.113.7'), false);
+      assert.strictEqual((await s.server.store.listBlocks()).length, 0);
+
+      // Denetim kaydı: her üç işlem de kayda geçmeli.
+      const kinds = (await b.get('/api/events')).json.events.map((e) => e.kind);
+      for (const kind of ['peer.kick', 'peer.block', 'peer.unblock']) {
+        assert.ok(kinds.includes(kind), `denetim kaydında eksik: ${kind}`);
+      }
+    } finally { await s.close(); }
+  });
+
+  await r.test('engel süresi dolunca kendiliğinden kalkar', async () => {
+    const s = await startStack({ user: { sub: 'u12', role: 'admin' } });
+    try {
+      const g = s.server.guard;
+      g.blockAddress('198.51.100.4', { ttlMs: 50, reason: 'geçici', actor: 'test' });
+      assert.strictEqual(g.isBlocked('198.51.100.4'), true);
+      assert.strictEqual(g.isBlocked('198.51.100.4', Date.now() + 100), false,
+                         'süresi dolan engel sorgulandığında düşmeli');
+      assert.strictEqual(g.listBlocks().length, 0);
     } finally { await s.close(); }
   });
 
