@@ -24,7 +24,7 @@ Hiçbir üçüncü parti bağımlılık yoktur; yalnızca `node:crypto`, `node:d
 ## Kurulum
 
 ```bash
-npm install node-dtls
+npm install @fitfak/dtls
 ```
 
 Node.js ≥ 20 gerekir.
