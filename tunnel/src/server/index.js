@@ -103,6 +103,13 @@ class TunnelServer extends EventEmitter {
         ordered: false,
         maxTrackedPackets: 8192,
         maxRetransmits: 15,
+        // Tünel, kanala segment boyutundan (16 KiB) büyük bir mesaj VERMEZ;
+        // en büyüğü APP_SYNC denetim mesajıdır (tavanı 256 KiB). Kütüphane
+        // varsayılanı (16 MiB) genel amaçlı; burada gerçek kullanıma çekmek,
+        // bozuk ya da ele geçirilmiş bir ucun alıcı belleğini şişirebileceği
+        // aralığı iki mertebe daraltıyor.
+        maxMessageBytes: 1024 * 1024,
+        maxReassemblyBytes: 8 * 1024 * 1024,
         // Tıkanıklık denetimi — varsayılan BBRv3.
         congestionControl: this.options.congestionControl,
       },

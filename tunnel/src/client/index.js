@@ -135,6 +135,10 @@ class TunnelClient extends EventEmitter {
           maxTrackedPackets: 8192,
           maxRetransmits: 15,
           congestionControl: o.congestionControl,
+          // Bkz. sunucu tarafındaki aynı ayar: tünelin gerçekte ürettiği
+          // mesaj boyutlarına çekilmiş alıcı tavanı.
+          maxMessageBytes: 1024 * 1024,
+          maxReassemblyBytes: 8 * 1024 * 1024,
         },
       });
     } catch (err) {

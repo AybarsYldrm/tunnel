@@ -38,6 +38,8 @@
 
 const crypto = require('node:crypto');
 
+const { canonicalIp } = require('../protocol/codec.js');
+
 /** Tur süresi örnekleri bu pencerede tutulur; sonra taze yarıya devredilir. */
 const RTT_WINDOW_MS = 30_000;
 /** Bu değerin üstündeki turlar "düşünme süresi" sayılır ve örneklenmez. */
@@ -92,7 +94,9 @@ class Peer {
     this.publicPort = publicPort;
     this.tunnelId = tunnelId;
     this.tunnelName = tunnelName;
-    this.address = address;
+    // Kanonik biçim: panelde gösterilen, engellenen ve sayaçlarda kullanılan
+    // adres AYNI dize olmalı (bkz. protocol/codec.js `canonicalIp`).
+    this.address = canonicalIp(address);
     this.port = port;
     this._kick = kick;
 
@@ -228,9 +232,10 @@ class PeerRegistry {
 
   /** Bir adrese ait TÜM açık bağlantıları kapatır (engelleme sonrası). */
   kickAddress(address) {
+    const ip = canonicalIp(address);
     let n = 0;
     for (const peer of [...this.peers.values()]) {
-      if (peer.address === address && this.kick(peer.id)) n++;
+      if (peer.address === ip && this.kick(peer.id)) n++;
     }
     return n;
   }
@@ -245,9 +250,10 @@ class PeerRegistry {
   list({ appId = null, address = null, limit = 1000 } = {}) {
     const now = Date.now();
     const out = [];
+    const wanted = address ? canonicalIp(address) : null;
     for (const peer of this.peers.values()) {
       if (appId && peer.appId !== appId) continue;
-      if (address && peer.address !== address) continue;
+      if (wanted && peer.address !== wanted) continue;
       out.push(peer.toJSON(now));
       if (out.length >= limit) break;
     }

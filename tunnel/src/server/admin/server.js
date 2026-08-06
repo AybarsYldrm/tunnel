@@ -22,6 +22,8 @@ const {
 } = require('./auth.js');
 
 const PUBLIC_DIR = path.join(__dirname, 'public');
+/** Aynı anda açık canlı akış (SSE) tavanı. */
+const MAX_SSE_CLIENTS = 64;
 const STATIC_TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -447,6 +449,12 @@ class AdminServer {
 
   // ---- canlı akış ---------------------------------------------------------
   _sse(req, res) {
+    // Her SSE bağlantısı bir zamanlayıcı ve bir açık soket tutar. Tavan
+    // olmadan, oturumu olan tek bir tarayıcı sekmesi bile (yenilenip duran bir
+    // sayfa, kapanmayan bağlantılar) sunucuyu kendi kendine yorabilirdi.
+    if (this._sseClients.size >= MAX_SSE_CLIENTS) {
+      return this._json(res, 503, { error: 'too_many_streams' });
+    }
     res.writeHead(200, {
       'content-type': 'text/event-stream',
       'cache-control': 'no-store',

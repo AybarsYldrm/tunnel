@@ -26,6 +26,7 @@
 // koca bir binayı tek bir kötü istemci yüzünden dışarıda bırakır.
 
 const { KeyedCounter } = require('../common/rate.js');
+const { canonicalIp, ipToBuffer } = require('../protocol/codec.js');
 
 const DEFAULTS = Object.freeze({
   acceptPerIpPerSec: 30,
@@ -78,6 +79,12 @@ const REASON = Object.freeze({
 });
 
 class Guard {
+  /**
+   * DİKKAT: adres alan HER genel metot girdiyi `canonicalIp` ile normalize
+   * eder. Normalizasyonu çağrı noktalarına bırakmak, tek bir yerde unutulduğu
+   * anda engellerin ve sayaçların sessizce ikiye bölünmesi demek olurdu —
+   * bkz. protocol/codec.js `canonicalIp`.
+   */
   constructor(options = {}, log = null) {
     this.opt = { ...DEFAULTS, ...options };
     this.log = log;
@@ -134,13 +141,14 @@ class Guard {
    * hafızasıdır ve onu burada düşürmek cezayı sıfırlardı. Temizlik
    * `sweep()`te, hatırlama süresi dolunca yapılır.
    */
-  isBanned(ip, now = Date.now()) {
-    const b = this.bans.get(ip);
+  isBanned(address, now = Date.now()) {
+    const b = this.bans.get(canonicalIp(address));
     return !!b && b.until > now;
   }
 
   /** Bir sınırı tetikleyen kaynağı işaretler; ısrar ederse yasaklanır. */
-  penalize(ip, reason, now = Date.now()) {
+  penalize(address, reason, now = Date.now()) {
+    const ip = canonicalIp(address);
     let v = this.violations.get(ip);
     if (!v || now - v.at > this.opt.violationDecayMs) v = { n: 0, at: now };
     v.n += 1;
@@ -162,7 +170,11 @@ class Guard {
     return true;
   }
 
-  unban(ip) { this.bans.delete(ip); this.violations.delete(ip); }
+  unban(address) {
+    const ip = canonicalIp(address);
+    this.bans.delete(ip);
+    this.violations.delete(ip);
+  }
 
   // -------------------------------------------------------------------------
   // Elle engelleme (yönetim panelinden)
@@ -176,8 +188,18 @@ class Guard {
    * @returns {object} kayıt
    */
   blockAddress(address, { ttlMs = 0, reason = '', actor = '', at = Date.now() } = {}) {
-    const ip = String(address || '').trim();
-    if (!ip) throw Object.assign(new Error('adres gerekli'), { status: 400, code: 'invalid_request' });
+    const raw = String(address || '').trim();
+    if (!raw) throw Object.assign(new Error('adres gerekli'), { status: 400, code: 'invalid_request' });
+    // Geçerli bir IP olduğunu BURADA doğruluyoruz. Doğrulamasak, panele
+    // yazılan bir yazım hatası ("203.0.113." gibi) hiçbir şeyi engellemeyen
+    // ama engellenmiş görünen bir kayıt üretirdi — güvenlik arayüzlerinde en
+    // kötü sonuç budur: yanlış bir güvende olma hissi.
+    if (!ipToBuffer(raw)) {
+      throw Object.assign(new Error(`geçersiz IP adresi: ${raw.slice(0, 64)}`), {
+        status: 400, code: 'invalid_request',
+      });
+    }
+    const ip = canonicalIp(raw);
     const record = {
       address: ip,
       reason: String(reason || '').slice(0, 200),
@@ -190,12 +212,13 @@ class Guard {
     return record;
   }
 
-  unblockAddress(address) { return this.blocks.delete(String(address || '').trim()); }
+  unblockAddress(address) { return this.blocks.delete(canonicalIp(address)); }
 
   isBlocked(address, now = Date.now()) {
-    const b = this.blocks.get(address);
+    const ip = canonicalIp(address);
+    const b = this.blocks.get(ip);
     if (!b) return false;
-    if (b.expiresAt && b.expiresAt <= now) { this.blocks.delete(address); return false; }
+    if (b.expiresAt && b.expiresAt <= now) { this.blocks.delete(ip); return false; }
     return true;
   }
 
@@ -213,8 +236,10 @@ class Guard {
     for (const row of rows) {
       if (!row || !row.address) continue;
       if (row.expiresAt && row.expiresAt <= now) continue;
-      this.blocks.set(row.address, {
-        address: row.address,
+      // Eski kayıtlar normalize edilmemiş olabilir; yüklerken düzeltiyoruz.
+      const ip = canonicalIp(row.address);
+      this.blocks.set(ip, {
+        address: ip,
         reason: row.reason || '',
         actor: row.actor || '',
         at: Number(row.at) || now,
@@ -231,7 +256,8 @@ class Guard {
   /**
    * @returns {{ok: boolean, reason: string|null}}
    */
-  checkAccept(ip, appId, now = Date.now()) {
+  checkAccept(address, appId, now = Date.now()) {
+    const ip = canonicalIp(address);
     // Elle konan engel en başta denetlenir ve CEZALANDIRMAZ: karar zaten
     // verilmiş, ayrıca üstel yasak saymanın anlamı yok.
     if (this.isBlocked(ip, now)) {
@@ -262,14 +288,16 @@ class Guard {
     return { ok: false, reason };
   }
 
-  noteOpen(ip, appId) {
+  noteOpen(address, appId) {
+    const ip = canonicalIp(address);
     this.stats.accepted++;
     this.connsGlobal++;
     this.connsByIp.set(ip, (this.connsByIp.get(ip) || 0) + 1);
     if (appId) this.connsByApp.set(appId, (this.connsByApp.get(appId) || 0) + 1);
   }
 
-  noteClose(ip, appId) {
+  noteClose(address, appId) {
+    const ip = canonicalIp(address);
     this.connsGlobal = Math.max(0, this.connsGlobal - 1);
     const n = (this.connsByIp.get(ip) || 1) - 1;
     if (n <= 0) this.connsByIp.delete(ip); else this.connsByIp.set(ip, n);
@@ -283,7 +311,8 @@ class Guard {
    * Slowloris: bağlantıyı açıp hiçbir şey göndermeyen istemci. Zamanlayıcı
    * ilk bayt gelince iptal edilir.
    */
-  armFirstByte(socket, ip) {
+  armFirstByte(socket, address) {
+    const ip = canonicalIp(address);
     const timer = setTimeout(() => {
       this.stats.slowlorisKilled++;
       this.penalize(ip, 'slowloris');
@@ -301,7 +330,8 @@ class Guard {
   // -------------------------------------------------------------------------
 
   /** @returns {{ok:boolean, reason:string|null}} */
-  checkUdpInbound(ip, bytes, isNewFlow, now = Date.now()) {
+  checkUdpInbound(address, bytes, isNewFlow, now = Date.now()) {
+    const ip = canonicalIp(address);
     if (this.isBlocked(ip, now)) {
       this.stats.udpDropped++;
       this.stats.blockedRejections++;
@@ -355,12 +385,14 @@ class Guard {
     return true;
   }
 
-  noteUdpFlowOpen(ip) {
+  noteUdpFlowOpen(address) {
+    const ip = canonicalIp(address);
     this.udpFlowsGlobal++;
     this.udpFlowsByIp.set(ip, (this.udpFlowsByIp.get(ip) || 0) + 1);
   }
 
-  noteUdpFlowClose(ip) {
+  noteUdpFlowClose(address) {
+    const ip = canonicalIp(address);
     this.udpFlowsGlobal = Math.max(0, this.udpFlowsGlobal - 1);
     const n = (this.udpFlowsByIp.get(ip) || 1) - 1;
     if (n <= 0) this.udpFlowsByIp.delete(ip); else this.udpFlowsByIp.set(ip, n);

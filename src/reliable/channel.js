@@ -65,6 +65,17 @@ const DEFAULTS = Object.freeze({
   maxRetransmits: 12,      // parça başına vazgeçme sınırı
   maxTrackedPackets: 4096, // bellek tavanı (tıkanıklık penceresinin üstünde sert sınır)
   maxReassembly: 256,      // eşzamanlı yeniden birleştirilen mesaj sayısı
+  /**
+   * Tek bir mesajın azami boyutu ve TÜM yeniden birleştirmelerin toplam tavanı.
+   *
+   * Bunlar olmadan alıcı tarafın belleği tamamen GÖNDERENİN elindeydi: bir
+   * DATA çerçevesi `count` alanında 65535 parça bildirebilir ve her parça MTU
+   * kadar olabilir — tek mesajda ~78 MB, `maxReassembly` kadar eşzamanlı
+   * mesajla gigabaytlar. Parça sayısını sınırlamak yetmez, gelen baytları da
+   * saymak gerekir; ikisi ayrı ayrı aşılabilir.
+   */
+  maxMessageBytes: 16 * 1024 * 1024,
+  maxReassemblyBytes: 64 * 1024 * 1024,
   maxOrderedBuffer: 128,   // sıralı modda bekletilecek mesaj sayısı
   maxDedupeEntries: 8192,  // teslim edilmiş mesaj kimlikleri (yineleme eleme)
   maxAckRanges: 32,
@@ -142,13 +153,14 @@ class ReliableChannel extends EventEmitter {
     this.largestReceived = -1;
     this.largestReceivedAt = 0;
     this.reassembly = new Map();     // "stream:msg" -> parça toplayıcı
+    this.reassemblyBytes = 0;        // tüm yarım mesajların toplamı
     this.orderedState = new Map();   // streamId -> { next, buffer }
     this.delivered = new Set();      // "stream:msg" -> teslim edildi (yineleme eleme)
 
     this.stats = {
       sent: 0, resent: 0, acked: 0, received: 0, duplicates: 0,
       bytesSent: 0, bytesReceived: 0, giveUps: 0, probes: 0, lost: 0,
-      unreliableSent: 0,
+      unreliableSent: 0, oversized: 0, reassemblyDropped: 0,
     };
   }
 
@@ -573,21 +585,59 @@ class ReliableChannel extends EventEmitter {
 
     let m = this.reassembly.get(key);
     if (!m) {
-      if (this.reassembly.size >= this.opts.maxReassembly) {
-        // En eskiyi düşür — bellek tükenmesine karşı sert sınır.
-        this.reassembly.delete(this.reassembly.keys().next().value);
+      // Bildirilen parça sayısı tek başına mesajın tavanını aşıyorsa, tek bir
+      // bayt bile ayırmadan reddet: gönderen niyetini `count` alanında zaten
+      // açık etmiştir.
+      if (count * (this.opts.mtu - DATA_HEADER_LEN) > this.opts.maxMessageBytes) {
+        this.stats.oversized++;
+        this._softError(new Error(
+          `mesaj çok büyük: ${count} parça bildirildi (tavan ${this.opts.maxMessageBytes} bayt)`,
+        ));
+        return;
       }
+      if (this.reassembly.size >= this.opts.maxReassembly) this._dropOldestReassembly();
       m = { chunks: new Array(count), have: 0, count, ordered, bytes: 0 };
       this.reassembly.set(key, m);
     }
     if (m.chunks[idx] !== undefined) { this.stats.duplicates++; return; }
+
+    // Toplam tavan: tek tek küçük ama birlikte büyük olan yarım mesajlar da
+    // aynı belleği tüketir. Yer açmak için en eskisini düşürüyoruz — yarım
+    // kalan mesaj zaten teslim edilemez.
+    while (this.reassemblyBytes + payload.length > this.opts.maxReassemblyBytes
+           && this.reassembly.size > 1) {
+      this._dropOldestReassembly(key);
+    }
+
     m.chunks[idx] = payload;
     m.have++;
     m.bytes += payload.length;
+    this.reassemblyBytes += payload.length;
+
+    if (m.bytes > this.opts.maxMessageBytes) {
+      this.reassembly.delete(key);
+      this.reassemblyBytes -= m.bytes;
+      this.stats.oversized++;
+      this._softError(new Error(`mesaj tavanı aşıldı: ${m.bytes} bayt`));
+      return;
+    }
+
     if (m.have === m.count) {
       this.reassembly.delete(key);
+      this.reassemblyBytes -= m.bytes;
       this._markDelivered(key);
       this._deliver(streamId, msgId, Buffer.concat(m.chunks, m.bytes), m.ordered);
+    }
+  }
+
+  /** En eski yarım mesajı düşürür. `except` verilirse o atlanır. */
+  _dropOldestReassembly(except = null) {
+    for (const [key, m] of this.reassembly) {
+      if (key === except) continue;
+      this.reassembly.delete(key);
+      this.reassemblyBytes -= m.bytes;
+      this.stats.reassemblyDropped++;
+      return;
     }
   }
 
@@ -751,6 +801,7 @@ class ReliableChannel extends EventEmitter {
     this.queuedBytesCount = 0;
     this.queued.clear();
     this.reassembly.clear();
+    this.reassemblyBytes = 0;
     this.orderedState.clear();
     this.delivered.clear();
     this.recovery.reset();
