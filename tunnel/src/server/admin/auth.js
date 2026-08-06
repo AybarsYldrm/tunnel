@@ -23,6 +23,23 @@ const https = require('node:https');
 const SESSION_COOKIE = 'fitfak_tunnel_admin';
 const PKCE_COOKIE = 'fitfak_tunnel_pkce';
 
+/**
+ * Yarım kalmış giriş akışlarının tavanı.
+ *
+ * `beginLogin()` KİMLİK DOĞRULAMASI OLMADAN çağrılabilir — `/login` herkese
+ * açık olmak zorunda. Tavan olmasaydı, panele ulaşabilen biri `/login` isteğini
+ * tekrarlayarak süreç belleğini büyütebilirdi; kayıtlar 10 dakika boyunca
+ * silinmiyor. Panel varsayılan olarak geri döngüde dinliyor ama önüne bir ters
+ * proxy konduğunda bu yüzey dışarıya açılıyor.
+ *
+ * Tavan dolduğunda EN ESKİ akış düşürülür: devam eden meşru bir girişin
+ * kesilmesi, süreç belleğinin tükenmesinden iyidir ve kullanıcı yeniden
+ * deneyebilir.
+ */
+const MAX_PENDING_FLOWS = 512;
+/** Aynı anda açık yönetici oturumu tavanı. */
+const MAX_SESSIONS = 256;
+
 function b64url(buf) { return buf.toString('base64url'); }
 
 function parseCookies(req) {
@@ -103,6 +120,13 @@ class AdminAuth {
     const verifier = b64url(crypto.randomBytes(32));
     const challenge = b64url(crypto.createHash('sha256').update(verifier).digest());
 
+    if (this.flows.size >= MAX_PENDING_FLOWS) {
+      // Map ekleme sırasını korur: en eski = ilk anahtar.
+      this.flows.delete(this.flows.keys().next().value);
+      this.log?.warn('bekleyen giriş akışı tavanı doldu, en eskisi düşürüldü', {
+        tavan: MAX_PENDING_FLOWS,
+      });
+    }
     this.flows.set(state, { verifier, createdAt: Date.now(), returnTo });
 
     const url = new URL('/oauth/authorize', this.config.idpUrl);
@@ -182,6 +206,12 @@ class AdminAuth {
       createdAt: Date.now(),
       expiresAt: Date.now() + this.config.sessionTtlMs,
     };
+    if (this.sessions.size >= MAX_SESSIONS) {
+      this.sweep();
+      if (this.sessions.size >= MAX_SESSIONS) {
+        this.sessions.delete(this.sessions.keys().next().value);
+      }
+    }
     this.sessions.set(sid, session);
     this.log.info('yönetici oturum açtı', { user: session.username, email });
     return { sid, session, returnTo: flow.returnTo || '/' };
@@ -199,7 +229,14 @@ class AdminAuth {
     ];
   }
 
-  /** @returns {object|null} geçerli oturum */
+  /**
+   * @returns {object|null} geçerli oturum
+   *
+   * Oturum kimliği 256 bitlik rastgele bir değer ve arama bir Map araması.
+   * Sabit zamanlı karşılaştırma kullanılmıyor: saldırganın bir zamanlama
+   * sızıntısından yararlanabilmesi için tahminini bayt bayt daraltabilmesi
+   * gerekir; hash tabanlı bir aramada böyle bir kademe yok.
+   */
   resolve(req) {
     if (!this.enabled) {
       return {
@@ -248,5 +285,6 @@ function assertSameOrigin(req, allowedOrigins) {
 }
 
 module.exports = {
-  AdminAuth, parseCookies, httpJson, assertSameOrigin, SESSION_COOKIE, PKCE_COOKIE,
+  AdminAuth, parseCookies, httpJson, assertSameOrigin,
+  SESSION_COOKIE, PKCE_COOKIE, MAX_PENDING_FLOWS, MAX_SESSIONS,
 };

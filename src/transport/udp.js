@@ -14,6 +14,7 @@ class UdpEndpoint extends EventEmitter {
       logComponent,
       type = 'udp4',
       recvBufferSize = 1 << 20,
+      sendBufferSize = 0,
       host,
       port,
     } = opts;
@@ -21,6 +22,21 @@ class UdpEndpoint extends EventEmitter {
     this.name = logComponent || name;
     this.log = mk(this.name);
     this.sock = dgram.createSocket({ type, recvBufferSize });
+    /**
+     * Çekirdeğin gönderim tamponu.
+     *
+     * Neden KÜÇÜLTMEK isteyelim? Çünkü orası bizim GÖREMEDİĞİMİZ bir kuyruk.
+     * Hız şekillendirici paketleri zamana yayar, ama çekirdek tamponu büyükse
+     * paketler oraya yığılır ve NIC'ten çıkana kadar bekler. O bekleme:
+     *   • RTT ölçümüne karışır (zaman damgasını göndermeden ÖNCE alıyoruz),
+     *   • öncelik sıralamasını ETKİSİZ KILAR — bir oyun paketi bizim
+     *     kuyruğumuzu atlar ama çekirdekteki 200 KB'ın arkasına düşer.
+     * Şekillendirici zaten hızı sınırladığı için büyük bir çekirdek tamponuna
+     * ihtiyaç yok; kuyruk, önceliği bilen yerde durmalı.
+     *
+     * 0 = dokunma (işletim sistemi varsayılanı).
+     */
+    this.sendBufferSize = sendBufferSize;
     this.stats = { rxDatagrams: 0, txDatagrams: 0, rxBytes: 0, txBytes: 0 };
     this._defaultHost = host;
     this._defaultPort = port;
@@ -61,6 +77,14 @@ class UdpEndpoint extends EventEmitter {
       this.sock.once('error', onErr);
       this.sock.bind(port, address, () => {
         this.sock.removeListener('error', onErr);
+        // Tampon boyutları yalnızca bağlandıktan SONRA ayarlanabilir.
+        if (this.sendBufferSize > 0) {
+          try { this.sock.setSendBufferSize(this.sendBufferSize); } catch (e) {
+            // Ayrıcalık ya da sistem sınırı yüzünden reddedilebilir; bu bir
+            // arıza değil, yalnızca istediğimiz optimizasyonun uygulanmaması.
+            this.log.debug('gönderim tamponu ayarlanamadı', { message: e.message });
+          }
+        }
         const aa = this.sock.address();
         this.log.info(`listening on ${aa.address}:${aa.port}`);
         resolve(aa);
@@ -92,6 +116,13 @@ class UdpEndpoint extends EventEmitter {
   }
 
   address() { return this.sock.address(); }
+
+  /** Çekirdeğin gerçekte verdiği tampon boyutları — teşhis için. */
+  bufferSizes() {
+    try {
+      return { send: this.sock.getSendBufferSize(), recv: this.sock.getRecvBufferSize() };
+    } catch { return { send: null, recv: null }; }
+  }
 
   close() {
     return new Promise((resolve) => this.sock.close(resolve));

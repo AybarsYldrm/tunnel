@@ -138,12 +138,23 @@ function bindSocketToStream(socket, stream, {
   // ---- akış → soket -------------------------------------------------------
   stream.on('data', (chunk) => {
     touch();
-    if (onBytes) onBytes('out', chunk.length);
-    if (socket.destroyed) { shaper.release(chunk.length); return; }
+    if (socket.destroyed) {
+      if (onBytes) onBytes('out', chunk.length);
+      shaper.release(chunk.length);
+      return;
+    }
     // Kredi, veri çekirdeğe teslim EDİLDİKTEN sonra verilir. Hemen vermek,
     // pencereyi "aldım" anlamına indirger; oysa soruyu "işledim mi" diye
     // sormamız gerekiyor.
-    socket.write(chunk, () => shaper.release(chunk.length));
+    //
+    // Ölçüm kancası da aynı ana bağlı ve bu bilinçli: tur süresi ölçümünün
+    // başlangıç damgası buradan geliyor. Yazma KUYRUĞA ALINDIĞI anda damga
+    // atsaydık, tünel sıkışıkken kendi kuyruk gecikmemizi karşı tarafın ağ
+    // gecikmesi olarak raporlardık.
+    socket.write(chunk, () => {
+      if (onBytes) onBytes('out', chunk.length);
+      shaper.release(chunk.length);
+    });
   });
 
   stream.on('end', () => {

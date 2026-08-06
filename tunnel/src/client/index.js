@@ -52,6 +52,9 @@ class TunnelClient extends EventEmitter {
       cipher: 'balanced',
       /** Tıkanıklık denetimi: 'bbr3' (varsayılan) ya da 'newreno'. */
       congestionControl: 'bbr3',
+      /** Çekirdek UDP tamponları; gönderim için 0 = işletim sistemi varsayılanı. */
+      sendBufferSize: 0,
+      recvBufferSize: 1024 * 1024,
       reconnect: true,
       maxBackoffMs: 30_000,
       name: os.hostname(),
@@ -121,12 +124,21 @@ class TunnelClient extends EventEmitter {
         revocation: o.revocation,
         mtu: o.mtu,
         cipherSuites: o.cipher,
+        // Çekirdek gönderim tamponu: küçük tutmak, hız şekillendiricinin
+        // göremediği ikinci bir kuyruğun oluşmasını engeller. Yükleme yönü
+        // buradan geçtiği için asıl etkili olduğu taraf da burası.
+        sendBufferSize: o.sendBufferSize,
+        recvBufferSize: o.recvBufferSize,
         rejectUnauthorized: true,
         reliable: {
           ordered: false,        // sıra kararı akış başına veriliyor
           maxTrackedPackets: 8192,
           maxRetransmits: 15,
           congestionControl: o.congestionControl,
+          // Bkz. sunucu tarafındaki aynı ayar: tünelin gerçekte ürettiği
+          // mesaj boyutlarına çekilmiş alıcı tavanı.
+          maxMessageBytes: 1024 * 1024,
+          maxReassemblyBytes: 8 * 1024 * 1024,
         },
       });
     } catch (err) {
@@ -300,6 +312,11 @@ class TunnelClient extends EventEmitter {
       stream.reset(RST_CODE.APP_DISABLED);
       return;
     }
+    // Hizmet sınıfını akışa uygula. YÜKLEME YÖNÜ BU TARAFTAN GEÇER: ev
+    // bağlantısının dar olan yönü burasıdır, dolayısıyla sıralamanın asıl
+    // etkili olduğu yer de burası. Sunucu tarafında sınıfı bilip istemcide
+    // bilmemek, darboğazın tam ortasında sıralamayı kaybetmek olurdu.
+    this.mux.setStreamPriority(stream, app.qos);
     // Güvenilir kipteki UDP uygulaması da bir AKIŞ üzerinden gelir, ama
     // ucundaki soket TCP değil UDP'dir.
     if (app.proto === PROTO.UDP) { this._openReliableUdp(stream, app); return; }
@@ -610,6 +627,8 @@ async function startTunnelClient(config) {
     mtu: config.mtu,
     cipher: config.cipher,
     congestionControl: config.congestionControl,
+    sendBufferSize: config.sendBufferSize,
+    recvBufferSize: config.recvBufferSize,
     name: config.name,
     binds: config.binds,
     limits: config.limits,

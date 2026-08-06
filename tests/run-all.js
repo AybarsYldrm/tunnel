@@ -20,6 +20,8 @@ const SUITES = [
   // Tünel katmanı: aynı çekirdeği kullanıyor ve aynı test PKI'sına dayanıyor,
   // bu yüzden ayrı bir koşucu değil bu listenin devamı.
   '../tunnel/test/test-protocol.js',
+  '../tunnel/test/test-qos.js',
+  '../tunnel/test/test-hardening.js',
   '../tunnel/test/test-tunnel.js',
   '../tunnel/test/test-admin.js',
 ];

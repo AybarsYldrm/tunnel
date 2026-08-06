@@ -406,6 +406,10 @@ const reliable = {
   maxRetransmits: 12,         // parça başına vazgeçme sınırı
   initialRtt: 333,            // RTT örneği alınana kadarki tahmin (ms)
   ackDelay: 10,               // ACK'leri toplama gecikmesi (ms)
+
+  // Alıcı bellek tavanları — gönderenin bildirdiği parça sayısına güvenilmez.
+  maxMessageBytes: 16 * 1024 * 1024,     // tek mesaj
+  maxReassemblyBytes: 64 * 1024 * 1024,  // tüm yarım mesajların toplamı
 };
 
 const sock = await dtls.connect({ host, port, ca, reliable });
@@ -413,6 +417,7 @@ const sock = await dtls.connect({ host, port, ca, reliable });
 await sock.send(bigBuffer);                       // teyitlenene kadar bekler
 await sock.send(telemetry, { reliable: false });  // tek atım, yeniden gönderilmez
 await sock.send(chunk, { streamId: 7 });          // bağımsız sıralanan akış
+await sock.send(gamePacket, { priority: 1 });     // öncelikli bant (0 = en yüksek)
 
 sock.on('data', (buf, meta) => {
   // meta = { streamId, msgId, ordered }
@@ -449,6 +454,11 @@ Uygulanan mekanizmalar:
   bekletmez; tamamlanan mesaj anında yukarı çıkar.
 * **Sıralı teslim** (`ordered: true`) — akış (`streamId`) içinde sıra korunur;
   farklı akışlar birbirini etkilemez.
+* **Öncelikli gönderim kuyruğu** (`priority`, 0 = en yüksek) — kuyruk tek bir
+  FIFO değil, dört bantlı. Gecikmeye duyarlı küçük bir paket, önündeki hacimli
+  verinin boşalmasını beklemez; yeniden gönderimler de kendi bandının başına
+  döner, bandını atlamaz. Tünel katmanı bunu uygulama başına hizmet sınıfına
+  bağlar (bkz. `tunnel/README.md` — Hizmet sınıfı).
 
 ### Tıkanıklık denetimi: BBRv3 (varsayılan)
 
@@ -709,6 +719,10 @@ bilinçli olarak **yoktur**.
   handshake seli sınırlandırılır.
 * **Replay koruması.** Epoch başına 64 genişliğinde kayan pencere; SRTP'de SSRC
   başına ayrı pencere.
+* **Alıcı bellek tavanı.** Güvenilir kanalda birleştirme belleği, gönderenin
+  bildirdiği parça sayısına bırakılmaz: hem tek mesaj (`maxMessageBytes`) hem
+  tüm eşzamanlı birleştirmelerin toplamı (`maxReassemblyBytes`) ayrı ayrı
+  sınırlıdır. Tavan aşıldığında bağlantı düşmez, en eski yarım mesaj atılır.
 * **Sabit hata mesajları.** AEAD başarısızlıkları hangi aşamada olduğunu
   sızdırmayan tek bir mesaj döndürür.
 * **Anahtar materyali loglanmaz.** Tanılama günlükleri hiçbir seviyede gizli

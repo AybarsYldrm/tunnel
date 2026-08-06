@@ -167,7 +167,35 @@ module.exports = {
     streamWindow: 256 * 1024,
     connectionWindow: 8 * 1024 * 1024,
     maxStreams: 4096,
+
+    /**
+     * Kanalın gönderim kuyruğunda birikmesine izin verilen GECİKME (ms).
+     *
+     * Bu tek sayı, "hacimli bir aktarım sürerken diğer her şey bekliyor"
+     * sorununun düğümü. Çoklayıcı kanala bu süreden fazlasını doldurmaz.
+     * Ölçünün bayt değil zaman olması şart: aynı bayt bütçesi 1 Gbit'te 2 ms,
+     * 5 Mbit'te altı saniye eder.
+     *
+     * Düşürmek gecikmeyi iyileştirir ama çok düşürülürse hat boş kalabilir
+     * (kanal, ACK geldiğinde gönderecek veri bulamaz). 10-40 ms makul aralık.
+     */
+    targetQueueMs: 20,
   },
+
+  // ---- çekirdek soket tamponları ------------------------------------------
+  /**
+   * UDP gönderim tamponu (bayt). 0 = işletim sistemi varsayılanı.
+   *
+   * Küçültmek NEDEN iyi olabilir: çekirdek tamponu bizim GÖREMEDİĞİMİZ bir
+   * kuyruktur. Hız şekillendirici paketleri zamana yayar, ama tampon büyükse
+   * paketler oraya yığılır ve öncelik sıralaması etkisiz kalır — gerçek zamanlı
+   * bir paket bizim kuyruğumuzu atlar, çekirdektekinin arkasına düşer.
+   * Şekillendirici zaten hızı sınırladığı için büyük bir tampona ihtiyaç yok.
+   *
+   * Yavaş yükleme hatlarında (≤50 Mbit) 256 KB iyi bir başlangıç.
+   */
+  sendBufferSize: 0,
+  recvBufferSize: 1024 * 1024,
 
   // ---- koruma -------------------------------------------------------------
   guard: {

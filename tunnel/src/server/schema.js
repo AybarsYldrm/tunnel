@@ -49,6 +49,7 @@ module.exports = {
       { no: 5, name: 'proto', type: 'int32' },
       { no: 6, name: 'delivery', type: 'int32' },
       { no: 7, name: 'ordered', type: 'bool' },
+      { no: 21, name: 'qos', type: 'int32' },
       { no: 8, name: 'localHost', type: 'string' },
       { no: 9, name: 'localPort', type: 'int32' },
       { no: 10, name: 'publicPort', type: 'int32' },

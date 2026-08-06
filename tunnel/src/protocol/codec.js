@@ -134,8 +134,16 @@ function ipToBuffer(address) {
     if (parts.length !== 4) return null;
     const out = Buffer.allocUnsafe(4);
     for (let i = 0; i < 4; i++) {
+      // ONDALIK BASAMAK ZORUNLU. `Number()`e güvenmek fazla gevşek:
+      // `Number('')` sıfır verir (yani "203.0.113." geçerli görünür),
+      // `Number('0x10')` on altı verir, `Number(' 7 ')` yediyi. Bunlar
+      // adresin kendisi için zararsız görünse de bu fonksiyon aynı zamanda
+      // "bu bir IP mi" sorusunun tek yanıtlayıcısı — engel listesi girdisini
+      // o doğruluyor. Yazım hatası içeren bir kaydı kabul etmek, hiçbir şeyi
+      // engellemeyen ama engellenmiş görünen bir kural üretir.
+      if (!/^\d{1,3}$/.test(parts[i])) return null;
       const n = Number(parts[i]);
-      if (!Number.isInteger(n) || n < 0 || n > 255) return null;
+      if (n > 255) return null;
       out[i] = n;
     }
     return out;
@@ -214,8 +222,36 @@ function bufferToIp(raw) {
   return `${head}::${tail}`;
 }
 
+/**
+ * Bir adresi KANONİK metin biçimine indirger.
+ *
+ * Neden gerekli — ve neden bir güvenlik meselesi:
+ *
+ * Node, çift yığınlı bir soketten gelen IPv4 bağlantısını `::ffff:203.0.113.7`
+ * olarak, tek yığınlı bir soketten gelen aynı bağlantıyı `203.0.113.7` olarak
+ * verir. IPv6 gösterimi ayrıca sıkıştırılabilir (`2001:db8:0:0:0:0:0:1` ile
+ * `2001:db8::1` aynı adrestir) ve büyük/küçük harf serbesttir.
+ *
+ * Engelleme, yasaklama ve kaynak başına sayaçların tamamı DİZE KARŞILAŞTIRMASI
+ * yapıyor. Normalize edilmezse şu olur: yönetici panelde `203.0.113.7` yazar,
+ * kayıt öyle saklanır, ama gelen bağlantı `::ffff:203.0.113.7` olarak görünür
+ * ve eşleşme olmaz. Engel SESSİZCE ÇALIŞMAZ — yönetici adresi engellediğini
+ * sanır, adres girmeye devam eder. Aynı ayrışma hız sayaçlarını da ikiye böler
+ * ve kaynak başına sınırları etkisiz kılar.
+ *
+ * @returns {string} çözümlenemeyen girdi kırpılarak aynen döner (yine de
+ *   tutarlı bir anahtar olur; uydurma bir değer üretmekten iyidir)
+ */
+function canonicalIp(address) {
+  const text = String(address ?? '').trim();
+  if (!text) return '';
+  const raw = ipToBuffer(text);
+  if (!raw) return text.slice(0, 64).toLowerCase();
+  return bufferToIp(raw);
+}
+
 module.exports = {
   Writer, Reader, ProtocolError,
-  encodeIp, decodeIp, ipToBuffer, bufferToIp,
+  encodeIp, decodeIp, ipToBuffer, bufferToIp, canonicalIp,
   ADDR,
 };

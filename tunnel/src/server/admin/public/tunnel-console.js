@@ -446,6 +446,8 @@
         ['Tıkanıklık penceresi', bytes(link.congestionWindow) + ' · uçuşta ' + bytes(link.bytesInFlight)],
         ['Model durumu', link.ccState || '—'],
         ['Kayıp', (link.lossRate * 100).toFixed(3) + '% · ' + link.retransmits + ' yeniden gönderim'],
+        ['Kuyruk (kanal)', bytes(link.channelQueuedBytes || 0) + ' / ' + bytes(link.queueAllowanceBytes || 0)],
+        ['Sırada (sınıfa göre)', (link.queuedByBand || []).join(' · ') || '—'],
       ]),
       section('Trafik', [
         ['Anlık', '↓ ' + bits(t.traffic.rateIn) + ' / ↑ ' + bits(t.traffic.rateOut)],
@@ -602,7 +604,12 @@
       td(tr, [mono(p.address), sub('kaynak port ' + p.port)]);
       td(tr, [strongCell(p.appName || '—'), sub(p.protocol + ' · ' + (p.tunnelName || '—'))]);
       td(tr, mono(String(p.publicPort || '—')), 'num');
-      td(tr, [rttCell(p), sub(p.samples ? p.samples + ' ölçüm' : 'ölçülmedi')], 'num');
+      td(tr, [
+        rttCell(p),
+        sub(p.samples
+          ? (p.samples + ' ölçüm · son ' + (p.lastRttMs === null ? '—' : Math.round(p.lastRttMs) + ' ms'))
+          : 'ölçülmedi'),
+      ], 'num');
       td(tr, duration(p.uptimeMs), 'num');
       td(tr, [
         bytes(p.bytesIn + p.bytesOut),
@@ -689,6 +696,23 @@
   // ======================================================================
   // UYGULAMALAR
   // ======================================================================
+  /**
+   * Hizmet sınıfı rozeti. Renk kodu bilinçli: gerçek zamanlı olan "iyi" değil,
+   * ÖNCELİKLİ demek — panelde bunun bir performans göstergesi değil bir
+   * yapılandırma seçimi olduğu görünmeli.
+   */
+  var QOS_LABEL = {
+    realtime: 'gerçek zamanlı',
+    interactive: 'etkileşimli',
+    bulk: 'hacimli',
+  };
+  var QOS_KIND = { realtime: 'ok', interactive: 'neutral', bulk: 'dark' };
+
+  function qosBadge(qos) {
+    var key = QOS_LABEL[qos] ? qos : 'interactive';
+    return badge(QOS_LABEL[key], QOS_KIND[key]);
+  }
+
   function appStatusBadge(a) {
     if (!a.enabled) return badge('kapalı', 'neutral');
     if (a.live && a.live.bound) return badge('yayında', 'ok');
@@ -720,7 +744,7 @@
         : (a.requestedPublicPort
           ? badge('istenen ' + a.requestedPublicPort, 'warn')
           : badge('otomatik', 'neutral')));
-      td(tr, badge(a.delivery, 'neutral'));
+      td(tr, [badge(a.delivery, 'neutral'), ' ', qosBadge(a.qos)]);
       td(tr, [
         (a.rateInBps ? bits(a.rateInBps) : '∞') + ' ↑',
         sub((a.rateOutBps ? bits(a.rateOutBps) : '∞') + ' ↓'),
@@ -793,6 +817,16 @@
       hint('TCP her zaman kayıpsızdır. UDP\'de kayıp toleranslı teslim, gecikmeye duyarlı '
            + 'yükler (ses, video, oyun) için doğru olandır: geciken bir paket, düşen bir '
            + 'paketten kötüdür.'),
+      labelFor('f-qos', 'Hizmet sınıfı (QoS)'),
+      select('f-qos', [
+        { value: 'realtime', label: 'Gerçek zamanlı — oyun, ses, görüntü' },
+        { value: 'interactive', label: 'Etkileşimli — web, SSH, API (varsayılan)' },
+        { value: 'bulk', label: 'Hacimli — dosya aktarımı, yedekleme' },
+      ], e.qos || 'interactive'),
+      hint('Sınıf BANT GENİŞLİĞİ PAYI DEĞİLDİR; “kim önce” sorusunu yanıtlar. Aynı tünelde '
+           + 'bir dosya indirmesi sürerken oyun paketlerinin sırada beklememesini sağlayan '
+           + 'şey budur. Gerçek zamanlı sınıf küçük ve sık paketler varsayar — hacimli bir '
+           + 'aktarımı oraya koymak, koruduğu şeyi bozar.'),
       fieldRow([
         field('f-public', 'İstenen genel port',
               input('f-public', 'number', e.requestedPublicPort || 0, { min: '0', max: '65535' })),
@@ -818,6 +852,7 @@
         localPort: Number($('f-port').value),
         protocol: $('f-proto').value,
         delivery: $('f-delivery').value,
+        qos: $('f-qos').value,
         publicPort: Number($('f-public').value) || 0,
         maxConns: Number($('f-maxconns').value) || 0,
         rateInMbit: Number($('f-ratein').value) || 0,
