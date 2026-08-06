@@ -25,7 +25,7 @@
 const { EventEmitter } = require('node:events');
 
 const {
-  STREAM, CTRL, DATA, LIMITS, RST_CODE,
+  STREAM, CTRL, DATA, LIMITS, RST_CODE, QOS,
 } = require('../protocol/constants.js');
 const frames = require('../protocol/frames.js');
 const { CONNECTION_STREAM } = frames;
@@ -33,6 +33,27 @@ const { TokenBucket, RateMeter } = require('./rate.js');
 
 /** Bir akışın sırası geldiğinde kazandığı bayt hakkı (DRR kuantumu). */
 const SCHED_QUANTUM = 32 * 1024;
+/** Gerçek zamanlı bantta kuantum: küçük, çünkü paketler de küçük. */
+const REALTIME_QUANTUM = 8 * 1024;
+/**
+ * Alt bant bu kadar süredir hiç sıra alamadıysa, üst bant dolu olsa bile bir
+ * kuantumluk hak verilir.
+ *
+ * Katı öncelik doğru cevaptır ama TEK BAŞINA tehlikelidir: "gerçek zamanlı"
+ * işaretlenmiş yanlış yapılandırılmış (ya da kötü niyetli) bir uygulama hattı
+ * sonsuza kadar sahiplenebilir. Bu koruma, en kötü durumda bile alt bandın
+ * ilerlemesini garanti eder; bedeli, üst banda eklenen en fazla bir kuantumluk
+ * gecikmedir.
+ */
+const STARVATION_GUARD_MS = 50;
+/**
+ * Gerçek zamanlı bandın kanal kuyruğu payı, diğerlerinin kaç katı.
+ *
+ * Gerçek zamanlı yük tanımı gereği küçüktür; ona geniş bir pay vermek hacimli
+ * trafiği geciktirmez ama küçük bir paketin "kuyruk dolu" diye bekletilmesini
+ * engeller.
+ */
+const REALTIME_QUEUE_FACTOR = 4;
 /** Yazma kuyruğu bu boyutu aşınca `write()` false döner (geri basınç sinyali). */
 const STREAM_HIGH_WATER = 512 * 1024;
 /** Biriken kredileri toplu göndermek için bekleme. */
@@ -52,6 +73,11 @@ class TunnelStream extends EventEmitter {
     this.mux = mux;
     this.id = id;
     this.meta = meta || {};
+    /**
+     * Hizmet sınıfı — zamanlayıcının hangi bantta sıraya koyacağını belirler.
+     * Uygulamadan gelir (panelden ayarlanabilir); verilmezse etkileşimli.
+     */
+    this.priority = normalizePriority(meta && meta.qos);
 
     // --- gönderim tarafı
     this.queue = [];
@@ -170,11 +196,36 @@ class Mux extends EventEmitter {
     this.connPendingCredit = 0;
 
     this.streams = new Map();
-    this.active = [];          // DRR sırası
+    /**
+     * Hizmet sınıfı başına bir DRR sırası. Bantlar arasında KATI ÖNCELİK,
+     * bant içinde açık farklı sıralı dağıtım (DRR).
+     *
+     * Neden iki katman? Bant, "kim önce" sorusunu yanıtlar (gecikmeye duyarlı
+     * yük hacimli yükün önünde). DRR, "aynı sınıftakiler arasında kim ne kadar"
+     * sorusunu yanıtlar (tek bir indirme, aynı sınıftaki diğer bağlantıları
+     * aç bırakamaz). Yalnızca DRR olsaydı oyun paketi web indirmesiyle
+     * bant genişliğini yarı yarıya bölüşürdü — oysa ihtiyacı bant genişliği
+     * değil, SIRADA BEKLEMEMEK.
+     */
+    this.bands = [[], [], [], []];
+    this.bandLastServed = [0, 0, 0, 0];
     this.pumping = false;
     this.outstandingBytes = 0; // kanala verilmiş ama henüz ACK'lenmemiş
     this.rateTimer = null;
     this.creditTimer = null;
+
+    /**
+     * Kanalın kuyruğunda tutulmasına izin verilen azami GECİKME.
+     *
+     * Bu tek sayı, "web indirmesi sürerken sayfa 15 saniyede açılıyor"
+     * sorununun merkezindeydi. Eski sürüm kanala bayt cinsinden bir bütçe
+     * (4 MiB'e kadar) veriyordu; 5 Mbit'lik bir hatta 4 MiB, ALTI SANİYELİK
+     * baş-tıkanması demektir. Bütçeyi zamana bağlamak bu sayıyı hattın hızından
+     * bağımsız hâle getiriyor: hız ne olursa olsun kuyruk bu kadar sürer.
+     */
+    this.targetQueueMs = limits.targetQueueMs || LIMITS.TARGET_QUEUE_MS;
+    /** ACK bekleyen toplam veri için sert bellek tavanı. */
+    this.maxOutstandingBytes = limits.maxOutstandingBytes || LIMITS.MAX_OUTSTANDING_BYTES;
 
     /** Tünel geneli çıkış şekillendirici (yönetim panelinden ayarlanır). */
     this.egressBucket = egressBucket || new TokenBucket({ ratePerSec: 0 });
@@ -316,7 +367,12 @@ class Mux extends EventEmitter {
   _activate(stream) {
     if (stream.inActive || stream.closed) return;
     stream.inActive = true;
-    this.active.push(stream);
+    const band = this.bands[stream.priority];
+    // Bant boştan doluya geçiyorsa açlık sayacını ŞİMDİ başlat. Aksi hâlde
+    // saatlerdir boş duran bir bant, ilk paketinde "açlıktan ölüyorum" diyip
+    // üst bandın önüne geçerdi.
+    if (band.length === 0) this.bandLastServed[stream.priority] = Date.now();
+    band.push(stream);
   }
 
   _deactivate(stream) {
@@ -324,21 +380,105 @@ class Mux extends EventEmitter {
     stream.inActive = false;
     stream.creditedThisRound = false;
     stream.deficit = 0;
-    const i = this.active.indexOf(stream);
-    if (i >= 0) this.active.splice(i, 1);
+    const band = this.bands[stream.priority];
+    const i = band.indexOf(stream);
+    if (i >= 0) band.splice(i, 1);
+  }
+
+  /** Akışın sınıfını değiştirir (uygulama QoS'u panelden güncellenirse). */
+  setStreamPriority(stream, qos) {
+    const next = normalizePriority(qos);
+    if (next === stream.priority) return;
+    const wasActive = stream.inActive;
+    if (wasActive) this._deactivate(stream);
+    stream.priority = next;
+    if (wasActive && (stream.queuedBytes > 0 || stream.finQueued)) this._activate(stream);
+  }
+
+  /** Bir akışın toplam kuyruk uzunluğu (tüm bantlar). */
+  get activeStreamCount() {
+    return this.bands[0].length + this.bands[1].length
+      + this.bands[2].length + this.bands[3].length;
   }
 
   /**
-   * Kanala aynı anda verilecek azami bayt.
+   * Sıradaki bandı seçer: en yüksek öncelikli, BESLENEBİLİR ve boş olmayan
+   * bant — ama altta açlıktan bekleyen bir bant varsa bir kereliğine ona sıra
+   * verilir.
    *
-   * Tıkanıklık penceresinin iki katı: bir pencere yolda, bir pencere kanalın
-   * kuyruğunda beklesin ki ACK gelir gelmez gönderilecek veri hazır olsun
-   * (kanalı aç bırakmamak), ama daha fazlası kuyrukta beklemesin (diğer
-   * akışların ilk baytını geciktirmemek).
+   * "Beslenebilir" kontrolünün bant başına olması şart. Tek bir küresel fren
+   * kullanılsaydı şu olurdu: hacimli aktarım kanal kuyruğunu izin verilen
+   * seviyeye kadar doldurur, hemen ardından gelen bir oyun paketi ise
+   * "kuyruk dolu" diye HİÇ verilmez — oysa kanalın kuyruğu da önceliklidir ve
+   * o paketi verseydik en öne geçecekti. Sıralamayı bir katman aşağı taşıyıp
+   * sonra üst katmanda frenlemek, kazanılan şeyi geri vermek olurdu.
    */
-  _budget() {
-    const cwnd = this.socket.reliable ? this.socket.reliable.congestionWindow : 64 * 1024;
-    return Math.max(this.segmentBytes * 2, Math.min(cwnd * 2, 4 * 1024 * 1024));
+  _selectBand(now) {
+    let best = -1;
+    for (let b = 0; b < this.bands.length; b++) {
+      if (this.bands[b].length === 0) continue;
+      if (!this._canFeedChannel(b)) continue;
+      if (best < 0) { best = b; continue; }
+      if (now - this.bandLastServed[b] > STARVATION_GUARD_MS) return b;
+    }
+    return best;
+  }
+
+  /**
+   * Kanalın kuyruğunda bekletilmesine izin verilen bayt.
+   *
+   * Ölçü BAYT DEĞİL ZAMANDIR ve fark burada belirleyici. Sabit bir bayt bütçesi
+   * (eski sürüm: tıkanıklık penceresinin iki katı, 4 MiB'e kadar) hızlı bir
+   * hatta makul, yavaş bir hatta felakettir: 5 Mbit'te 4 MiB kuyruk, kuyruğa
+   * yeni giren her baytın ALTI SANİYE beklemesi demektir. Zamana bağlanınca
+   * hattın hızı değişse de kuyruğun ürettiği gecikme sabit kalır.
+   *
+   * Alt sınır neden var? Kuyruk tamamen boşalırsa ACK geldiği anda gönderilecek
+   * veri bulunmaz ve hat, bir sonraki besleme turuna kadar boş kalır. İki
+   * segment, bunu engelleyecek en küçük tampon.
+   */
+  _queueAllowance() {
+    const ch = this.socket.reliable;
+    const floor = this.segmentBytes * 2;
+    if (!ch) return floor;
+    const rate = ch.pacingRate;
+    if (!rate) {
+      // Henüz hız tahmini yok (ilk turlar): pencere kadarıyla yetin.
+      return Math.max(floor, Math.min(ch.congestionWindow || 0, this.maxOutstandingBytes));
+    }
+    const byTime = Math.floor((rate * this.targetQueueMs) / 1000);
+    // Taban, hedef süreden BÜYÜK olmamalı. Sabit "iki segment" bir tabanı,
+    // 5 Mbit'lik bir hatta 51 ms kuyruk demektir — yani hattın yavaşlığı
+    // hedefi delerdi. Kanalın aç kalmaması için bir segment yeter.
+    const adaptiveFloor = Math.min(floor, Math.max(this.segmentBytes, byTime));
+    return Math.max(adaptiveFloor, Math.min(byTime, this.maxOutstandingBytes));
+  }
+
+  /**
+   * Bu sınıftan kanala daha fazla veri verilebilir mi?
+   *
+   * İki ayrı sınır var ve ikisi farklı şeyi koruyor:
+   *   • kanal kuyruğu    → GECİKMEYİ sınırlar (baş-tıkanması)
+   *   • outstandingBytes → BELLEĞİ sınırlar (ACK bekleyen toplam veri)
+   *
+   * Kuyruk sınırı SINIFA GÖRE ölçeklenir. Gerekçe: bu sınırın amacı, üst
+   * katmanın sıralama kararının bayatlamasını engellemektir. Gerçek zamanlı
+   * bir paket için o karar zaten "hemen git"tir ve kanalın kendi kuyruğu da
+   * öncelikli olduğu için paket oraya girdiği anda en öne geçer. Onu üst
+   * katmanda bekletmek, koruduğumuz şeyi bozardı.
+   */
+  _canFeedChannel(band = QOS.INTERACTIVE) {
+    if (this.outstandingBytes >= this.maxOutstandingBytes) return false;
+    const ch = this.socket.reliable;
+    if (!ch) return this.outstandingBytes < this.segmentBytes * 8;
+
+    let allowance = this._queueAllowance();
+    if (band <= QOS.REALTIME) {
+      // Yine de sınırsız değil: kendi içinde baş-tıkanması yapan bir gerçek
+      // zamanlı akış da istemiyoruz, belleği de sınırsız bırakamayız.
+      allowance = Math.min(allowance * REALTIME_QUEUE_FACTOR, this.maxOutstandingBytes);
+    }
+    return ch.queuedBytes < allowance;
   }
 
   _pump() {
@@ -350,11 +490,16 @@ class Mux extends EventEmitter {
   _pumpLoop() {
     let blocked = 0;
     let rateWaitMs = 0;
+    let guard = 0;
 
-    while (this.active.length > 0) {
-      if (this.outstandingBytes >= this._budget()) break;
+    for (;;) {
+      if (++guard > 10_000) break;              // ilerleme yoksa döngüyü bırak
 
-      const stream = this.active[0];
+      const now = Date.now();
+      const band = this._selectBand(now);
+      if (band < 0) break;   // beslenebilir ve dolu bant yok
+      const queue = this.bands[band];
+      const stream = queue[0];
 
       if (stream.closed) { this._deactivate(stream); blocked = 0; continue; }
 
@@ -374,13 +519,21 @@ class Mux extends EventEmitter {
         continue;
       }
 
+      const quantum = band === QOS.REALTIME ? REALTIME_QUANTUM : SCHED_QUANTUM;
       if (!stream.creditedThisRound) {
-        stream.deficit += SCHED_QUANTUM;
+        stream.deficit += quantum;
         stream.creditedThisRound = true;
       }
 
+      // Gerçek zamanlı bantta segment küçük tutulur: 300 baytlık bir oyun
+      // paketini 16 KiB'lik bir bütçeyle göndermek, bütçeyi anlamsız kılar ve
+      // aynı bandın diğer akışlarını gereksiz bekletir.
+      const segment = band === QOS.REALTIME
+        ? Math.min(this.segmentBytes, LIMITS.REALTIME_SEGMENT_BYTES)
+        : this.segmentBytes;
+
       const allowance = Math.min(
-        this.segmentBytes,
+        segment,
         stream.deficit,
         stream.queuedBytes,
         stream.sendWindow,
@@ -395,10 +548,10 @@ class Mux extends EventEmitter {
           continue;
         }
         if (this.connSendWindow <= 0) break; // tünel geneli pencere: kimse ilerleyemez
-        // deficit tükendi: sıranın sonuna.
+        // deficit tükendi: bandın sonuna.
         stream.creditedThisRound = false;
-        this._rotate();
-        if (++blocked >= this.active.length) break;
+        this._rotate(queue);
+        if (++blocked >= queue.length) break;
         continue;
       }
 
@@ -409,6 +562,8 @@ class Mux extends EventEmitter {
       }
 
       blocked = 0;
+      this.bandLastServed[band] = now;
+
       const payload = this._takeFromQueue(stream, granted);
       stream.sendWindow -= payload.length;
       this.connSendWindow -= payload.length;
@@ -420,16 +575,16 @@ class Mux extends EventEmitter {
 
       if (stream.deficit <= 0) {
         stream.creditedThisRound = false;
-        this._rotate();
+        this._rotate(queue);
       }
     }
 
     if (rateWaitMs > 0) this._armRateTimer(rateWaitMs);
   }
 
-  _rotate() {
-    if (this.active.length < 2) return;
-    this.active.push(this.active.shift());
+  _rotate(queue) {
+    if (queue.length < 2) return;
+    queue.push(queue.shift());
   }
 
   _armRateTimer(ms) {
@@ -484,7 +639,9 @@ class Mux extends EventEmitter {
 
     let promise;
     try {
-      promise = this.socket.send(frame, { streamId: stream.id, ordered: true, reliable: true });
+      promise = this.socket.send(frame, {
+        streamId: stream.id, ordered: true, reliable: true, priority: stream.priority,
+      });
     } catch (err) {
       this.outstandingBytes -= accountedBytes;
       this.counters.sendFailures++;
@@ -525,13 +682,22 @@ class Mux extends EventEmitter {
     this._sendOnStream(stream, frames.frameOpenAck(), 0);
   }
 
-  /** Denetim mesajı — her zaman akış 0, sıralı. */
+  /**
+   * Denetim mesajı — her zaman akış 0, sıralı ve EN YÜKSEK ÖNCELİKLİ.
+   *
+   * Öncelik burada bir konfor değil, doğruluk meselesi: CREDIT çerçeveleri
+   * serbest bırakacakları verinin arkasında kuyruğa girerse akış denetimi
+   * kilitlenir — gönderen kredi bekler, kredi ise gönderenin kuyruğunda sıra
+   * bekler. PING/PONG'un gecikmesi ise RTT ölçümünü ve kalp atışını bozar.
+   */
   sendControl(frame) {
     if (this.closed) return Promise.resolve();
     this.counters.controlOut++;
     this.meterOut.add(frame.length);
     try {
-      const p = this.socket.send(frame, { streamId: STREAM.CONTROL, ordered: true, reliable: true });
+      const p = this.socket.send(frame, {
+        streamId: STREAM.CONTROL, ordered: true, reliable: true, priority: QOS.CONTROL,
+      });
       if (p && typeof p.catch === 'function') {
         return p.catch((err) => {
           this.counters.sendFailures++;
@@ -680,7 +846,7 @@ class Mux extends EventEmitter {
       // beklemesi demek olurdu.
       try {
         const p = this.socket.send(frames.frameRst(RST_CODE.RATE_LIMITED), {
-          streamId, ordered: true, reliable: true,
+          streamId, ordered: true, reliable: true, priority: QOS.CONTROL,
         });
         if (p && typeof p.catch === 'function') p.catch(() => {});
       } catch { /* oturum kapanmış */ }
@@ -797,7 +963,10 @@ class Mux extends EventEmitter {
     const now = Date.now();
     return {
       streams: this.streams.size,
-      activeStreams: this.active.length,
+      activeStreams: this.activeStreamCount,
+      queuedByBand: this.bands.map((b) => b.length),
+      channelQueuedBytes: this.socket.reliable ? this.socket.reliable.queuedBytes : 0,
+      queueAllowanceBytes: this._queueAllowance(),
       outstandingBytes: this.outstandingBytes,
       connSendWindow: this.connSendWindow,
       connRecvWindow: this.connRecvWindow,
@@ -843,11 +1012,21 @@ class Mux extends EventEmitter {
       stream.emit('close', { code: RST_CODE.TUNNEL_CLOSING, reason: 'tünel kapandı' });
     }
     this.streams.clear();
-    this.active.length = 0;
+    for (const band of this.bands) band.length = 0;
     this.emit('closed', err || null);
   }
 }
 
+/** QoS kodunu geçerli bir banda indirger; bilinmeyen değer etkileşimli olur. */
+function normalizePriority(qos) {
+  const n = Number(qos);
+  if (!Number.isInteger(n) || n < QOS.CONTROL || n > QOS.BULK) return QOS.INTERACTIVE;
+  // CONTROL bir uygulama sınıfı değildir: veri akışları onu talep edemez,
+  // yoksa bir uygulama kendini kredi mesajlarının önüne koyabilirdi.
+  return n === QOS.CONTROL ? QOS.INTERACTIVE : n;
+}
+
 module.exports = {
-  Mux, TunnelStream, SCHED_QUANTUM, STREAM_HIGH_WATER,
+  Mux, TunnelStream, SCHED_QUANTUM, REALTIME_QUANTUM, STREAM_HIGH_WATER,
+  STARVATION_GUARD_MS, REALTIME_QUEUE_FACTOR, normalizePriority,
 };

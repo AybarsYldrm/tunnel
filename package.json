@@ -39,6 +39,7 @@
     "example:revocation": "node examples/mtls-revocation.js",
     "test:tunnel": "node tunnel/test/test-tunnel.js",
     "test:tunnel-protocol": "node tunnel/test/test-protocol.js",
+    "test:tunnel-qos": "node tunnel/test/test-qos.js",
     "test:tunnel-admin": "node tunnel/test/test-admin.js",
     "tunnel:server": "node tunnel/bin/fitfak-tunneld.js",
     "tunnel:client": "node tunnel/bin/fitfak-tunnel.js"

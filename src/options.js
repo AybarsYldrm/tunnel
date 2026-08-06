@@ -377,6 +377,13 @@ function normalizeOptions(role, raw = {}) {
     maxSessions: Number(o.maxSessions),
     replayWindow: Number(o.replayWindow),
     keylogFile: raw.keylogFile || process.env.SSLKEYLOGFILE || null,
+    /**
+     * Çekirdek UDP tamponları. `sendBufferSize` küçültmek, hız
+     * şekillendiricinin göremediği ikinci bir kuyruğun oluşmasını engeller;
+     * 0 = işletim sistemi varsayılanına dokunma.
+     */
+    recvBufferSize: Number(raw.recvBufferSize) || 0,
+    sendBufferSize: Number(raw.sendBufferSize) || 0,
   };
 
   if (norm.srtp.enabled && norm.reliable) {

@@ -104,6 +104,42 @@ const DELIVERY = Object.freeze({
 });
 const DELIVERY_NAME = Object.freeze({ 1: 'reliable', 2: 'unreliable' });
 
+/**
+ * Hizmet sınıfı (QoS). KÜÇÜK SAYI = YÜKSEK ÖNCELİK.
+ *
+ * Neden adil paylaşım yetmiyor? Tünelde iki uygulama olduğunda çoklayıcının
+ * DRR'si her birine bant genişliğinin yarısını verir — bu ADALETTİR ama
+ * gecikmeye duyarlı yük için yanlış cevaptır. Bir oyun istemcisi saniyede
+ * ~50 kbit üretir; 25 Mbit'lik bir hatta ona "yarısını" vermek anlamsızdır.
+ * İhtiyacı bant genişliği değil SIRADA BEKLEMEMEKTİR.
+ *
+ * Katı öncelik bunu verir: gerçek zamanlı bandın gönderecek verisi varsa
+ * ÖNCE o gider. Küçük olduğu için alt bandı aç bırakmaz; büyürse açlık
+ * koruması devreye girer (bkz. mux.js).
+ *
+ * CONTROL bir uygulama sınıfı değildir ve panelden seçilemez: kredi ve kalp
+ * atışı mesajları serbest bırakacakları verinin arkasında beklerse akış
+ * denetimi kilitlenir.
+ */
+const QOS = Object.freeze({
+  /** Kredi, PING/PONG, OPEN/RST — protokolün kendi işleyişi. */
+  CONTROL: 0,
+  /** Oyun, ses, görüntü, uzak masaüstü. Gecikme her şeyden önemli. */
+  REALTIME: 1,
+  /** SSH, web sayfası, API çağrısı. Varsayılan sınıf. */
+  INTERACTIVE: 2,
+  /** Dosya aktarımı, yedekleme, medya indirmesi. Verim önemli, gecikme değil. */
+  BULK: 3,
+});
+const QOS_NAME = Object.freeze({
+  0: 'control', 1: 'realtime', 2: 'interactive', 3: 'bulk',
+});
+const QOS_CODE = Object.freeze({
+  control: 0, realtime: 1, interactive: 2, bulk: 3,
+});
+/** Panelden seçilebilen sınıflar — CONTROL hariç. */
+const QOS_SELECTABLE = Object.freeze(['realtime', 'interactive', 'bulk']);
+
 /** Akış/bağlantı sonlandırma sebepleri. */
 const RST_CODE = Object.freeze({
   UNSPECIFIED: 0,
@@ -135,21 +171,42 @@ const PROTOCOL_VERSION = 1;
 /**
  * Boyut sınırları.
  *
- * SEGMENT_BYTES neden 16 KiB? Kanalın gönderim kuyruğu TEK bir FIFO'dur: bir
- * mesajın tüm parçaları kuyruğa birlikte girer. 1 MiB'lik bir mesaj verilirse
- * arkasındaki her akış o mesaj bitene kadar bekler — tam da kaçınmak istediğimiz
+ * SEGMENT_BYTES neden 16 KiB? Kanala verilen her mesaj, kanalın kuyruğunda
+ * kendi parçalarıyla birlikte yer tutar. 1 MiB'lik bir mesaj verilirse
+ * arkasındaki akışlar o mesaj bitene kadar bekler — tam da kaçınmak istediğimiz
  * baş-tıkanması. 16 KiB, MTU'ya bölündüğünde ~15 parçadır: dolaşım süresini
- * dolduracak kadar büyük, adil sıralamayı bozmayacak kadar küçük.
+ * dolduracak kadar büyük, sıralamayı bozmayacak kadar küçük.
+ *
+ * Gerçek zamanlı bant için ayrıca daha küçük bir segment kullanılır
+ * (REALTIME_SEGMENT_BYTES): bir oyun paketi zaten 300 baytsa, onu 16 KiB'lik
+ * bir bütçeyle göndermek bütçenin kendisini anlamsız kılar.
  */
 const LIMITS = Object.freeze({
   /** Bir veri akışına tek seferde verilen azami yük. */
   SEGMENT_BYTES: 16 * 1024,
+  /** Gerçek zamanlı bantta segment: küçük ve sık. */
+  REALTIME_SEGMENT_BYTES: 4 * 1024,
   /** Akış başına başlangıç alım penceresi. */
   STREAM_WINDOW: 256 * 1024,
   /** Tünel geneli alım penceresi — tüm akışların toplam bellek tavanı. */
   CONNECTION_WINDOW: 8 * 1024 * 1024,
   /** Pencerenin bu oranı tüketilince kredi yollanır (her segmentte değil). */
   CREDIT_THRESHOLD: 0.5,
+  /**
+   * Kanalın gönderim kuyruğunda birikmesine izin verilen GECİKME (ms).
+   *
+   * Çoklayıcı kanala bu süreden fazlasını doldurmaz. Bayt yerine zaman
+   * kullanmanın sebebi: aynı bayt bütçesi 1 Gbit'te 2 ms, 5 Mbit'te 6 saniye
+   * eder. Kuyruk üst katmanın sıralama kararını GECİKTİRDİĞİ için, ölçünün
+   * doğrudan gecikme cinsinden olması gerekiyor.
+   *
+   * 20 ms neden? Tipik bir tünel RTT'sinin (40 ms) yarısı: ACK'ler geldiğinde
+   * gönderilecek veri hazır olacak kadar uzun, yeni bir akışın ilk baytını
+   * fark edilir şekilde geciktirmeyecek kadar kısa.
+   */
+  TARGET_QUEUE_MS: 20,
+  /** ACK bekleyen toplam veri için sert bellek tavanı. */
+  MAX_OUTSTANDING_BYTES: 4 * 1024 * 1024,
   /** Tünel başına eşzamanlı mantıksal akış tavanı. */
   MAX_STREAMS: 4096,
   /** Bir tünelin bağlayabileceği azami uygulama sayısı. */
@@ -181,6 +238,7 @@ module.exports = {
   STREAM, CTRL, DATA, DGRAM,
   PROTO, PROTO_NAME, PROTO_CODE,
   DELIVERY, DELIVERY_NAME,
+  QOS, QOS_NAME, QOS_CODE, QOS_SELECTABLE,
   RST_CODE, ERR_CODE,
   LIMITS, TIMING,
 };

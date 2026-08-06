@@ -18,6 +18,7 @@ const crypto = require('node:crypto');
 
 const {
   PROTO, PROTO_CODE, PROTO_NAME, DELIVERY, DELIVERY_NAME,
+  QOS, QOS_NAME, QOS_CODE,
 } = require('../protocol/constants.js');
 const { TokenBucket, RateMeter } = require('../common/rate.js');
 
@@ -40,6 +41,26 @@ function toDelivery(value, proto) {
   if (proto === PROTO.TCP) return DELIVERY.RELIABLE;
   if (typeof value === 'number') return value === DELIVERY.RELIABLE ? DELIVERY.RELIABLE : DELIVERY.UNRELIABLE;
   return String(value || 'unreliable').toLowerCase() === 'reliable' ? DELIVERY.RELIABLE : DELIVERY.UNRELIABLE;
+}
+
+/**
+ * Hizmet sınıfı. Verilmezse uygulamanın DOĞASINDAN çıkarılır:
+ *
+ *   UDP + kayıp toleranslı  → gerçek zamanlı. Bu kombinasyon zaten "geciken
+ *                             paket, düşen paketten kötü" demektir; oyun, ses
+ *                             ve görüntü tam olarak buradadır.
+ *   diğer her şey           → etkileşimli.
+ *
+ * Tahmin, kullanıcıyı doğru varsayılana yaklaştırır ama karar onundur: panelden
+ * her uygulama açıkça bir sınıfa atanabilir.
+ */
+function toQos(value, proto, delivery) {
+  if (value !== undefined && value !== null && value !== '') {
+    const n = typeof value === 'number' ? value : QOS_CODE[String(value).toLowerCase()];
+    if (Number.isInteger(n) && n >= QOS.REALTIME && n <= QOS.BULK) return n;
+  }
+  if (proto === PROTO.UDP && delivery === DELIVERY.UNRELIABLE) return QOS.REALTIME;
+  return QOS.INTERACTIVE;
 }
 
 function toPort(value, { allowZero = true } = {}) {
@@ -76,13 +97,19 @@ function normalizeApp(raw = {}, { source = 'admin', clientId = null } = {}) {
   const proto = toProto(raw.proto ?? raw.protocol);
   const localPort = toPort(raw.localPort, { allowZero: false });
   if (localPort < 1) throw invalid('localPort 1-65535 aralığında olmalı');
+  const delivery = toDelivery(raw.delivery, proto);
 
   return {
     appId: raw.appId || newAppId(),
     clientId: raw.clientId || clientId || '',
     name: String(raw.name || '').slice(0, 64) || `${PROTO_NAME[proto]}-${localPort}`,
     proto,
-    delivery: toDelivery(raw.delivery, proto),
+    delivery,
+    /**
+     * Hizmet sınıfı — çoklayıcının hangi bantta sıraya koyacağı.
+     * Bant genişliği payı DEĞİLDİR: sınıf "kim önce" sorusunu yanıtlar.
+     */
+    qos: toQos(raw.qos ?? raw.priority, proto, delivery),
     ordered: raw.ordered === undefined ? true : !!raw.ordered,
     localHost: sanitizeHost(raw.localHost),
     localPort,
@@ -133,6 +160,9 @@ function appToWire(app) {
     name: app.name,
     proto: app.proto,
     delivery: app.delivery,
+    // İstemci de sıralama yapar (yükleme yönü ONUN darboğazından geçer),
+    // bu yüzden sınıfı bilmesi gerekiyor.
+    qos: app.qos,
     ordered: app.ordered,
     localHost: app.localHost,
     localPort: app.localPort,
@@ -150,6 +180,8 @@ function appToPublic(app, { publicHost = '' } = {}) {
     name: app.name,
     protocol: PROTO_NAME[app.proto],
     delivery: DELIVERY_NAME[app.delivery],
+    qos: QOS_NAME[app.qos] || 'interactive',
+    qosCode: app.qos,
     ordered: app.ordered,
     local: `${app.localHost}:${app.localPort}`,
     localHost: app.localHost,
@@ -189,6 +221,7 @@ function appToRecord(app) {
     name: app.name,
     proto: app.proto,
     delivery: app.delivery,
+    qos: app.qos,
     ordered: app.ordered,
     localHost: app.localHost,
     localPort: app.localPort,
@@ -209,5 +242,5 @@ function appToRecord(app) {
 module.exports = {
   normalizeApp, attachRuntime, applyRates, invalid,
   appToWire, appToPublic, appToRecord,
-  newAppId, toProto, toDelivery, sanitizeHost, DEFAULT_IDLE_MS,
+  newAppId, toProto, toDelivery, toQos, sanitizeHost, DEFAULT_IDLE_MS,
 };

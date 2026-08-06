@@ -33,6 +33,21 @@ const { EventEmitter } = require('node:events');
 const { LossRecovery, DEFAULT_CONGESTION_CONTROL } = require('./recovery.js');
 
 const FRAME = Object.freeze({ RAW: 0x00, DATA: 0x01, ACK: 0x02, PING: 0x03, PONG: 0x04 });
+
+/**
+ * Gönderim kuyruğu öncelik bantları.
+ *
+ * Kanalın kuyruğu TEK bir FIFO olduğu sürece, üst katmanın (çoklayıcının) ne
+ * kadar akıllı sıraladığı önemsizdir: adil sıralanmış segmentler buraya girip
+ * geliş sırasına göre çıkar ve gecikmeye duyarlı küçük bir paket, önündeki
+ * hacimli veri boşalana kadar bekler. Üst katmanın kararının hayatta kalması
+ * için önceliğin BURAYA kadar inmesi gerekir.
+ *
+ * Sayı küçüldükçe öncelik artar. Çağıran (mux) kendi sınıflarını doğrudan bu
+ * bantlara eşler.
+ */
+const PRIORITY_BANDS = 4;
+const DEFAULT_PRIORITY = 2;
 const DATA_HEADER_LEN = 18;
 const PING_LEN = 11;
 const ACK_HEADER_LEN = 4;
@@ -104,8 +119,18 @@ class ReliableChannel extends EventEmitter {
     this.nextMsgId = new Map();      // streamId -> sonraki mesaj numarası
     this.chunks = new Map();         // chunkKey -> parça kaydı
     this.messages = new Map();       // msgKey  -> { pending, resolve, reject, settled, bytes }
-    this.sendQueue = [];             // gönderilmeyi bekleyen chunkKey'ler
-    this.queued = new Set();         // sendQueue üyelik indeksi (O(1) sorgu)
+    // Öncelik bandı başına bir FIFO. Bant içinde sıra korunur (aynı akışın
+    // parçaları karışmaz), bantlar arasında katı öncelik uygulanır.
+    this.sendBands = Array.from({ length: PRIORITY_BANDS }, () => []);
+    this.queuedCount = 0;
+    this.queuedBytesCount = 0;
+    // Kuyruk üyelik indeksi: anahtar -> yük boyutu.
+    //
+    // Boyutu burada tutmak şart; `chunks`tan okumak GÜVENİLİR DEĞİL. Bir parça
+    // kuyruktayken ACK'lenebilir (kayıp sanılıp yeniden kuyruğa alınmış eski
+    // bir gönderimi teyitleyen ACK) ve o anda `chunks`tan silinir. Boyut oradan
+    // okunsaydı, sayaçtan hiç düşülmez ve kuyruk sonsuza kadar "dolu" görünürdü.
+    this.queued = new Map();
     this.timer = null;
     this.timerAt = 0;
     this.pacingTimer = null;
@@ -123,6 +148,7 @@ class ReliableChannel extends EventEmitter {
     this.stats = {
       sent: 0, resent: 0, acked: 0, received: 0, duplicates: 0,
       bytesSent: 0, bytesReceived: 0, giveUps: 0, probes: 0, lost: 0,
+      unreliableSent: 0,
     };
   }
 
@@ -136,21 +162,40 @@ class ReliableChannel extends EventEmitter {
 
   /** Ayrıntılı kurtarma/tıkanıklık durumu — teşhis ve ölçüm için. */
   getStats() {
-    return { ...this.stats, ...this.recovery.snapshot(), queued: this.sendQueue.length };
+    return {
+      ...this.stats,
+      ...this.recovery.snapshot(),
+      queued: this.queuedCount,
+      queuedByPriority: this.sendBands.map((b) => b.length),
+    };
   }
 
   // ==========================================================================
   // Gönderme
   // ==========================================================================
+  /** Kuyrukta bekleyen parça sayısı (tüm bantlar). */
+  get queuedChunks() { return this.queuedCount; }
+
+  /**
+   * Kuyrukta bekleyen yük (bayt) — sayaçla tutulur, taranarak değil.
+   *
+   * Üst katman besleme derinliğini buna göre ayarlar ve bunu gönderilen HER
+   * paket için sorar; kuyruğu her seferinde gezmek, tam da sıcak yolda O(n)
+   * bir iş demek olurdu.
+   */
+  get queuedBytes() { return this.queuedBytesCount; }
+
   /**
    * Güvenilir mesaj gönderir. Tüm parçalar ACK'lenince çözülen Promise döner.
    * @param {Buffer} data
-   * @param {{ordered?:boolean, streamId?:number}} [opt]
+   * @param {{ordered?:boolean, streamId?:number, priority?:number}} [opt]
+   *   `priority` 0 = en yüksek. Verilmezse 2 (etkileşimli).
    */
   sendMessage(data, opt = {}) {
     if (this.closed) return Promise.reject(new Error('kanal kapalı'));
     const ordered = opt.ordered ?? this.defaultOrdered;
     const streamId = (opt.streamId ?? 0) & 0xffff;
+    const priority = clampPriority(opt.priority);
 
     // Mesaj numarası AKIŞ BAŞINA artar: sıralı teslim akış içinde işler,
     // farklı akışlar birbirini bekletmez.
@@ -170,25 +215,59 @@ class ReliableChannel extends EventEmitter {
     for (let i = 0; i < count; i++) {
       const chunkKey = `${msgKey}:${i}`;
       this.chunks.set(chunkKey, {
-        key: chunkKey, msgKey, streamId, msgId, idx: i, count, ordered,
+        key: chunkKey, msgKey, streamId, msgId, idx: i, count, ordered, priority,
         payload: data.subarray(i * payloadMax, Math.min((i + 1) * payloadMax, data.length)),
         attempts: 0,
       });
-      this.sendQueue.push(chunkKey);
-      this.queued.add(chunkKey);
+      this._enqueue(chunkKey, priority, false);
     }
 
     this._pump();
     return promise;
   }
 
-  /** Güvenilirlik istemeyen veri — kayıp olursa yeniden gönderilmez. */
+  /**
+   * @param {boolean} front kurtarma için: kaybolan veri KENDİ bandının başına
+   *   döner. Kuyruğun tepesine koymak, düşük öncelikli bir yeniden gönderimin
+   *   gerçek zamanlı trafiğin önüne geçmesi demek olurdu.
+   */
+  _enqueue(chunkKey, priority, front) {
+    const band = this.sendBands[clampPriority(priority)];
+    if (front) band.unshift(chunkKey); else band.push(chunkKey);
+    const chunk = this.chunks.get(chunkKey);
+    const bytes = chunk ? chunk.payload.length : 0;
+    this.queued.set(chunkKey, bytes);
+    this.queuedCount++;
+    this.queuedBytesCount += bytes;
+  }
+
+  /** Kuyruk sayaçlarını tek yerden düşür — üç ayrı çıkış yolu var. */
+  _unqueue(chunkKey) {
+    const bytes = this.queued.get(chunkKey);
+    if (bytes === undefined) return;
+    this.queued.delete(chunkKey);
+    this.queuedCount--;
+    this.queuedBytesCount -= bytes;
+  }
+
+  /**
+   * Güvenilirlik istemeyen veri — kayıp olursa yeniden gönderilmez.
+   *
+   * BEKLEMEZ: gecikmeye duyarlı yükü hız şekillendiricide kuyruklamak, tam da
+   * kaçınmak istediği şeyi yapar (geciken bir ses paketi, düşen bir ses
+   * paketinden kötüdür). Ama şekillendiriciye MUHASEBE EDİLİR: bu baytlar da
+   * hattan geçiyor. Edilmeseydi güvenilir taraf hattın tamamını boş sanıp
+   * onun üstüne gönderir, toplam hız darboğazı aşar ve herkesin gecikmesi
+   * artardı — yani oyun trafiğini korumak için yapılan şey oyunu bozardı.
+   */
   sendUnreliable(data) {
     if (this.closed) throw new Error('kanal kapalı');
     const frame = Buffer.allocUnsafe(1 + data.length);
     frame[0] = FRAME.RAW;
     data.copy(frame, 1);
     this.stats.bytesSent += frame.length;
+    this.stats.unreliableSent++;
+    this.recovery.noteUnpacedSend(frame.length);
     return this._write(frame);
   }
 
@@ -222,8 +301,9 @@ class ReliableChannel extends EventEmitter {
     if (this.closed) return;
     const now = Date.now();
 
-    while (this.sendQueue.length) {
-      const key = this.sendQueue[0];
+    for (;;) {
+      const key = this._peek();
+      if (key === null) break;
       const chunk = this.chunks.get(key);
       if (!chunk) { this._dequeue(); continue; }
 
@@ -241,7 +321,7 @@ class ReliableChannel extends EventEmitter {
     // Kuyruk boşaldı: bundan sonraki teslim hızı örnekleri AĞIN değil
     // uygulamanın hızını ölçer. İşaretlenmezse BBR, veri veremediğimiz için
     // boş kalan hattı yavaş bir hat sanar ve tahmini kalıcı olarak düşer.
-    if (this.sendQueue.length === 0) this.recovery.markAppLimited();
+    if (this.queuedCount === 0) this.recovery.markAppLimited();
 
     this._rearmTimer();
   }
@@ -253,10 +333,33 @@ class ReliableChannel extends EventEmitter {
     if (this.pacingTimer.unref) this.pacingTimer.unref();
   }
 
+  /** Sıradaki parçanın anahtarı — en yüksek öncelikli boş olmayan bant. */
+  _peek() {
+    for (let b = 0; b < this.sendBands.length; b++) {
+      if (this.sendBands[b].length) return this.sendBands[b][0];
+    }
+    return null;
+  }
+
   _dequeue() {
-    const key = this.sendQueue.shift();
-    this.queued.delete(key);
-    return key;
+    for (let b = 0; b < this.sendBands.length; b++) {
+      if (!this.sendBands[b].length) continue;
+      const key = this.sendBands[b].shift();
+      this._unqueue(key);
+      return key;
+    }
+    return undefined;
+  }
+
+  _removeFromQueue(predicate) {
+    for (let b = 0; b < this.sendBands.length; b++) {
+      const band = this.sendBands[b];
+      const kept = [];
+      for (const key of band) {
+        if (predicate(key)) this._unqueue(key); else kept.push(key);
+      }
+      this.sendBands[b] = kept;
+    }
   }
 
   _transmit(chunk) {
@@ -338,7 +441,7 @@ class ReliableChannel extends EventEmitter {
   _sendProbes(count) {
     // Öncelik: kuyrukta bekleyen yeni veri (zaten gönderilecekti).
     let sent = 0;
-    while (sent < count && this.sendQueue.length) {
+    while (sent < count && this.queuedCount > 0) {
       const chunk = this.chunks.get(this._dequeue());
       if (!chunk) continue;
       this._transmit(chunk);
@@ -367,8 +470,10 @@ class ReliableChannel extends EventEmitter {
   _handleLost(lost) {
     this.stats.lost += lost.length;
     // Kayıp paketlerin taşıdığı veriyi yeniden kuyruğa al — YENİ paket
-    // numarasıyla gidecek. Kuyruğun BAŞINA konur: kurtarma yeni veriden önceliklidir.
-    const requeue = [];
+    // numarasıyla gidecek. KENDİ BANDININ başına konur: kurtarma o bandın yeni
+    // verisinden önceliklidir ama bandını ATLAMAZ. Kuyruğun tepesine koymak,
+    // hacimli bir aktarımın yeniden gönderiminin gerçek zamanlı trafiğin önüne
+    // geçmesi demek olurdu — düzeltmeye çalıştığımız şeyin tam olarak kendisi.
     for (const entry of lost) {
       const key = entry.meta;
       if (!key) continue;
@@ -376,10 +481,8 @@ class ReliableChannel extends EventEmitter {
       if (!chunk) continue;                       // bu arada ACK'lenmiş
       if (this._giveUpIfExhausted(chunk)) continue;
       if (this.queued.has(key)) continue;         // zaten sırada
-      this.queued.add(key);
-      requeue.push(key);
+      this._enqueue(key, chunk.priority, true);
     }
-    if (requeue.length) this.sendQueue.unshift(...requeue);
   }
 
   _giveUpIfExhausted(chunk) {
@@ -396,12 +499,11 @@ class ReliableChannel extends EventEmitter {
     const record = this.messages.get(msgKey);
     const prefix = `${msgKey}:`;
 
+    // Sıra önemli: ÖNCE kuyruktan çıkar, SONRA parçaları sil. Tersi olsaydı
+    // kuyruk sayaçları silinmiş parçalara bakmaya çalışırdı.
+    if (this.queued.size) this._removeFromQueue((k) => k.startsWith(prefix));
     for (const key of [...this.chunks.keys()]) {
       if (key.startsWith(prefix)) this.chunks.delete(key);
-    }
-    if (this.queued.size) {
-      this.sendQueue = this.sendQueue.filter((k) => !k.startsWith(prefix));
-      for (const k of [...this.queued]) if (k.startsWith(prefix)) this.queued.delete(k);
     }
     // Bu mesaja ait uçuştaki paketleri kurtarma defterinden düş; aksi hâlde
     // asla ACK'lenmeyecek kayıtlar bytesInFlight'ı kalıcı olarak şişirir.
@@ -643,8 +745,10 @@ class ReliableChannel extends EventEmitter {
       record.reject(e);
       this.messages.delete(msgKey);
     }
+    for (const band of this.sendBands) band.length = 0;
     this.chunks.clear();
-    this.sendQueue.length = 0;
+    this.queuedCount = 0;
+    this.queuedBytesCount = 0;
     this.queued.clear();
     this.reassembly.clear();
     this.orderedState.clear();
@@ -653,7 +757,16 @@ class ReliableChannel extends EventEmitter {
   }
 }
 
+/** Bant dışına taşan öncelikleri geçerli aralığa kırpar. */
+function clampPriority(p) {
+  const n = Number.isInteger(p) ? p : DEFAULT_PRIORITY;
+  if (n < 0) return 0;
+  if (n >= PRIORITY_BANDS) return PRIORITY_BANDS - 1;
+  return n;
+}
+
 module.exports = {
   ReliableChannel, LossRecovery, FRAME,
+  PRIORITY_BANDS, DEFAULT_PRIORITY, clampPriority,
   DATA_HEADER_LEN, ACK_HEADER_LEN, ACK_RANGE_LEN, PING_LEN, DEFAULTS,
 };

@@ -413,6 +413,7 @@ const sock = await dtls.connect({ host, port, ca, reliable });
 await sock.send(bigBuffer);                       // teyitlenene kadar bekler
 await sock.send(telemetry, { reliable: false });  // tek atım, yeniden gönderilmez
 await sock.send(chunk, { streamId: 7 });          // bağımsız sıralanan akış
+await sock.send(gamePacket, { priority: 1 });     // öncelikli bant (0 = en yüksek)
 
 sock.on('data', (buf, meta) => {
   // meta = { streamId, msgId, ordered }
@@ -449,6 +450,11 @@ Uygulanan mekanizmalar:
   bekletmez; tamamlanan mesaj anında yukarı çıkar.
 * **Sıralı teslim** (`ordered: true`) — akış (`streamId`) içinde sıra korunur;
   farklı akışlar birbirini etkilemez.
+* **Öncelikli gönderim kuyruğu** (`priority`, 0 = en yüksek) — kuyruk tek bir
+  FIFO değil, dört bantlı. Gecikmeye duyarlı küçük bir paket, önündeki hacimli
+  verinin boşalmasını beklemez; yeniden gönderimler de kendi bandının başına
+  döner, bandını atlamaz. Tünel katmanı bunu uygulama başına hizmet sınıfına
+  bağlar (bkz. `tunnel/README.md` — Hizmet sınıfı).
 
 ### Tıkanıklık denetimi: BBRv3 (varsayılan)
 

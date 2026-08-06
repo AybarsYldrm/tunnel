@@ -55,12 +55,14 @@ class WindowedMin {
     this.windowMs = windowMs;
     this.current = null;
     this.next = null;
+    this.last = null;
     this.rotatedAt = 0;
     this.count = 0;
   }
 
   add(value, now) {
     this.count++;
+    this.last = value;
     if (this.rotatedAt === 0) this.rotatedAt = now;
     if (now - this.rotatedAt >= this.windowMs) {
       // Pencere kaydı: taze yarı ana tahmin olur, yeni yarı boş başlar.
@@ -111,6 +113,8 @@ class Peer {
 
   get rttMs() { return this.rtt.value; }
   get samples() { return this.rtt.count; }
+  /** En son ölçülen tur — dalgalanmanın görünür olması için. */
+  get lastRttMs() { return this.rtt.last; }
 
   toJSON(now = Date.now()) {
     return {
@@ -130,6 +134,7 @@ class Peer {
       packetsIn: this.packetsIn,
       packetsOut: this.packetsOut,
       rttMs: this.rttMs,
+      lastRttMs: this.lastRttMs,
       samples: this.samples,
       firstByteMs: this.firstByteMs,
     };
@@ -189,7 +194,16 @@ class PeerRegistry {
     peer.lastInAt = now;
   }
 
-  /** Bizden ziyaretçiye giden veri — bir sonraki turun başlangıç anı. */
+  /**
+   * Bizden ziyaretçiye giden veri — bir sonraki turun başlangıç anı.
+   *
+   * `now` çağıranın verdiği andır ve ÖNEMLİ olan hangi an olduğudur: bu değer
+   * soketin yazma geri çağrısından geliyorsa (bkz. common/pipe.js) baytların
+   * çekirdeğe teslim edildiği anı gösterir. Kuyruğa alındığı anı kullanmak,
+   * tünel sıkışıkken bizim kendi kuyruk gecikmemizi ziyaretçinin ağ
+   * gecikmesiymiş gibi raporlamak olurdu — tam da "ping neden 20'den 40'a
+   * çıkıyor" sorusunun kaynağı.
+   */
   noteOut(peer, bytes, now = Date.now()) {
     if (!peer) return;
     peer.bytesOut += bytes;
@@ -246,14 +260,19 @@ class PeerRegistry {
     const addresses = new Set();
     let rttSum = 0;
     let rttN = 0;
+    let measured = 0;
     for (const peer of this.peers.values()) {
       addresses.add(peer.address);
       if (peer.rttMs !== null) { rttSum += peer.rttMs; rttN++; }
+      // Güvenilir bir tahmin için birkaç örnek gerekir; iki ölçümden çıkan
+      // sayıyı ortalamaya katmak, ortalamayı gürültüye bağlar.
+      if (peer.samples >= 4) measured++;
     }
     return {
       active: this.peers.size,
       distinctAddresses: addresses.size,
       avgRttMs: rttN ? Math.round(rttSum / rttN) : null,
+      measuredPeers: measured,
       ...this.stats,
     };
   }

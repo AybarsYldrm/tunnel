@@ -43,7 +43,12 @@ class DtlsServer extends EventEmitter {
    */
   async listen(port = 0, host = '0.0.0.0') {
     if (this.transport) throw new Error('sunucu zaten dinliyor');
-    this.transport = new UdpEndpoint({ logComponent: 'dtls:udp', type: host.includes(':') ? 'udp6' : 'udp4' });
+    this.transport = new UdpEndpoint({
+      logComponent: 'dtls:udp',
+      type: host.includes(':') ? 'udp6' : 'udp4',
+      recvBufferSize: this.options.recvBufferSize || (1 << 20),
+      sendBufferSize: this.options.sendBufferSize || 0,
+    });
     this.transport.on('error', (e) => this.emit('error', e));
     this.transport.on('datagram', (dg, rinfo) => this._onDatagram(dg, rinfo));
 

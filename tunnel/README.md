@@ -194,6 +194,66 @@ yazıları bölüp birleştirebilir.
 
 ---
 
+## Hizmet sınıfı (QoS) ve öncelik
+
+Aynı tünelden bir dosya indirmesi ile bir oyun sunucusu birlikte aktığında,
+**adil paylaşım doğru cevap değildir.** Bir oyun istemcisi saniyede ~50 kbit
+üretir; 25 Mbit'lik bir hatta ona "yarısını" vermek anlamsızdır. İhtiyacı bant
+genişliği değil **sırada beklememektir**.
+
+Her uygulama bir sınıfa atanır (panelden, `Uygulamalar → Hizmet sınıfı`):
+
+| Sınıf | Ne için | Varsayılan olarak |
+|---|---|---|
+| **gerçek zamanlı** | Oyun, ses, görüntü, uzak masaüstü | UDP + kayıp toleranslı uygulamalar |
+| **etkileşimli** | Web, SSH, API — varsayılan | TCP uygulamaları |
+| **hacimli** | Dosya aktarımı, yedekleme, medya | elle seçilir |
+
+Sıralama iki katmanlıdır ve ikisi farklı soruyu yanıtlar:
+
+* **Bantlar arası katı öncelik** — "kim önce". Gerçek zamanlı bandın verisi
+  varsa önce o gider.
+* **Bant içi DRR** — "aynı sınıftakiler arasında kim ne kadar". Tek bir indirme,
+  aynı sınıftaki diğer bağlantıları aç bırakamaz.
+
+Katı öncelik tek başına tehlikelidir: yanlış işaretlenmiş bir uygulama hattı
+sahiplenebilir. **Açlık koruması** bunu bağlar — alt bant 50 ms'dir sıra
+alamadıysa, üst bant dolu olsa bile bir kuantumluk hak alır.
+
+Öncelik **kanal kuyruğuna kadar iner**. Yalnızca çoklayıcıda sıralamak yetmezdi:
+adil sıralanmış segmentler alttaki tek FIFO'ya girip geliş sırasına göre
+çıkardı. Denetim çerçeveleri (kredi, kalp atışı) en üst bandı kullanır —
+kredi, serbest bırakacağı verinin arkasında beklerse akış denetimi kilitlenir.
+
+### Kuyruk derinliği zamanla ölçülür
+
+Çoklayıcının kanala doldurduğu veri **süreyle** sınırlıdır (`limits.targetQueueMs`,
+varsayılan 20 ms), baytla değil. Sabit bir bayt bütçesi hızlı bir hatta makul,
+yavaş bir hatta felakettir: 5 Mbit'te 4 MiB kuyruk, kuyruğa yeni giren her
+baytın **altı saniye** beklemesi demektir. Zamana bağlanınca hattın hızı ne
+olursa olsun baş-tıkanması sabit bir üst sınırda kalır.
+
+Gerçek zamanlı bant bu sınırın dört katını kullanır: kanalın kuyruğu da
+öncelikli olduğu için oraya giren paket zaten en öne geçer; onu üst katmanda
+bekletmek kazanılan şeyi geri vermek olurdu.
+
+```js
+limits: {
+  targetQueueMs: 20,     // 10-40 ms makul aralık
+}
+```
+
+### Çekirdek gönderim tamponu
+
+`sendBufferSize` (varsayılan: işletim sistemine dokunma) küçültülebilir. Sebep:
+çekirdek tamponu **bizim göremediğimiz** bir kuyruktur. Hız şekillendirici
+paketleri zamana yayar, ama tampon büyükse paketler orada yığılır ve öncelik
+sıralaması etkisiz kalır — gerçek zamanlı bir paket bizim kuyruğumuzu atlar,
+çekirdektekinin arkasına düşer. Yavaş yükleme hatlarında (≤50 Mbit) 256 KB iyi
+bir başlangıçtır.
+
+---
+
 ## Akış denetimi ve adil sıralama
 
 ```
@@ -310,8 +370,8 @@ Panelde görülen ve ayarlanabilenler:
   yeniden gönderim, anlık ve toplam bant genişliği, açık akış sayısı
 - **Ziyaretçiler** — genel portlara **dışarıdan** bağlanan uçlar (aşağıda)
 - **Uygulamalar** — yerel hedef (`127.0.0.2:8080`), genel port (otomatik ya da
-  sabit), TCP/UDP, **kayıpsız / kayıp toleranslı teslim**, yön başına Mbit/s
-  sınırı, eşzamanlı bağlantı tavanı, port sabitleme
+  sabit), TCP/UDP, **kayıpsız / kayıp toleranslı teslim**, **hizmet sınıfı
+  (QoS)**, yön başına Mbit/s sınırı, eşzamanlı bağlantı tavanı, port sabitleme
 - **Port havuzu** — hangi port kime, ne zamandan beri, linger'da mı
 - **Koruma** — düşürülen trafik, yasaklı kaynaklar, yürürlükteki sınırlar
 - **Denetim kaydı** — kim, ne zaman, neyi değiştirdi
@@ -471,6 +531,9 @@ Ortam değişkenlerinin tamamı; ayrıntısı `src/server/config.js`'te.
 | `FITFAK_TUNNEL_SEGMENT_BYTES` | `16384` | DRR segment boyutu |
 | `FITFAK_TUNNEL_STREAM_WINDOW` | `262144` | Akış başına pencere |
 | `FITFAK_TUNNEL_CONNECTION_WINDOW` | `8388608` | Tünel geneli pencere |
+| `FITFAK_TUNNEL_TARGET_QUEUE_MS` | `20` | Kanal kuyruğunda izin verilen gecikme |
+| `FITFAK_TUNNEL_SEND_BUFFER` | `0` | UDP gönderim tamponu (0 = OS varsayılanı) |
+| `FITFAK_TUNNEL_RECV_BUFFER` | `1048576` | UDP alım tamponu |
 | `FITFAK_TUNNEL_LOG_LEVEL` | `INFO` | `TRACE`…`ERROR` |
 
 ---
@@ -479,6 +542,7 @@ Ortam değişkenlerinin tamamı; ayrıntısı `src/server/config.js`'te.
 
 ```bash
 npm run certs               # test PKI'sı (kök CA + sunucu + istemci)
+npm run test:tunnel-qos     # hizmet sınıfı, öncelikli zamanlayıcı, kuyruk derinliği
 npm run test:tunnel         # uçtan uca: gerçek DTLS, gerçek TCP/UDP soketleri
 npm run test:tunnel-protocol
 npm run test:tunnel-admin   # gerçek HTTP + gerçek OAuth 2.0 + PKCE akışı

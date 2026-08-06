@@ -99,7 +99,7 @@ class LossRecovery {
     this.stats = {
       packetsSent: 0, packetsAcked: 0, packetsLost: 0, probesSent: 0,
       congestionEvents: 0, persistentCongestion: 0, spuriousLoss: 0,
-      bytesLost: 0,
+      bytesLost: 0, unpacedBytes: 0,
     };
   }
 
@@ -172,6 +172,20 @@ class LossRecovery {
   pacingDelay(bytes, now = Date.now()) {
     if (!this.pacer) return 0;
     return this.pacer.delayUntilSend(bytes, now);
+  }
+
+  /**
+   * Hız şekillendiriciyi BEKLETMEDEN geçen bir gönderim (güvenilir olmayan
+   * datagram, gecikmeye duyarlı yük).
+   *
+   * Beklemez ama sayılır: o baytlar da darboğazdan geçiyor. Sayılmasaydı
+   * güvenilir taraf hattı olduğundan boş sanıp üstüne gönderir ve toplam hız
+   * darboğazı aşardı — gerçek zamanlı trafiği korumak için eklenen ayrıcalık,
+   * herkesin gecikmesini artırarak tam tersini yapardı.
+   */
+  noteUnpacedSend(bytes, now = Date.now()) {
+    this.stats.unpacedBytes += bytes;
+    if (this.pacer) this.pacer.onSent(bytes, now);
   }
 
   /**

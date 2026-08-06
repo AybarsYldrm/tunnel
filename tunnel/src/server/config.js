@@ -159,6 +159,16 @@ function loadServerConfig(overrides = {}) {
      */
     congestionControl: env('FITFAK_TUNNEL_CONGESTION_CONTROL', 'bbr3'),
 
+    /**
+     * Çekirdek UDP tamponları (bayt). Gönderim tamponu için 0 = dokunma.
+     *
+     * Küçük bir gönderim tamponu, hız şekillendiricinin göremediği ikinci bir
+     * kuyruğun oluşmasını engeller: büyük bir tamponda paketler çekirdekte
+     * yığılır ve öncelik sıralaması etkisiz kalır.
+     */
+    sendBufferSize: envInt('FITFAK_TUNNEL_SEND_BUFFER', 0),
+    recvBufferSize: envInt('FITFAK_TUNNEL_RECV_BUFFER', 1024 * 1024),
+
     // ---- genel (dış dünyaya bakan) yüzey --------------------------------------------------
     publicHost: env('FITFAK_TUNNEL_PUBLIC_HOST', '0.0.0.0'),
     /** Panelde ve istemciye gösterilen ad; bağlama adresi DEĞİL. */
@@ -236,6 +246,8 @@ function loadServerConfig(overrides = {}) {
       streamWindow: envInt('FITFAK_TUNNEL_STREAM_WINDOW', 256 * 1024),
       connectionWindow: envInt('FITFAK_TUNNEL_CONNECTION_WINDOW', 8 * 1024 * 1024),
       maxStreams: envInt('FITFAK_TUNNEL_MAX_STREAMS', 4096),
+      /** Kanal kuyruğunda birikmesine izin verilen gecikme (ms). */
+      targetQueueMs: envInt('FITFAK_TUNNEL_TARGET_QUEUE_MS', 20),
     },
 
     // ---- koruma ---------------------------------------------------------------------------

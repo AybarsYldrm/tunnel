@@ -95,6 +95,8 @@ class TunnelServer extends EventEmitter {
       // Şifreleme paketi tercihi: politika adı ('balanced', 'chacha20', ...)
       // ya da açık suite listesi. Sunucunun sırası bağlayıcıdır.
       cipherSuites: this.options.cipher,
+      sendBufferSize: this.options.sendBufferSize,
+      recvBufferSize: this.options.recvBufferSize,
       reliable: {
         // Sıra kararı akış BAŞINA veriliyor (mux her gönderimde açıkça
         // belirtiyor), kanal genelinde değil.

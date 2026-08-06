@@ -235,6 +235,7 @@ class DatabaseStore {
       name: app.name,
       proto: app.proto,
       delivery: app.delivery,
+      qos: app.qos,
       ordered: !!app.ordered,
       localHost: app.localHost,
       localPort: app.localPort,
@@ -280,6 +281,9 @@ class DatabaseStore {
       name: r.name,
       proto: num(r.proto, 1),
       delivery: num(r.delivery, 1),
+      // 0 = kayıt QoS'tan önce yazılmış; normalizeApp uygulamanın doğasından
+      // çıkarsın diye undefined bırakılıyor.
+      qos: num(r.qos) || undefined,
       ordered: !!r.ordered,
       localHost: r.localHost,
       localPort: num(r.localPort),

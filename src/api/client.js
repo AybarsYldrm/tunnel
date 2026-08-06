@@ -33,6 +33,8 @@ function connect(rawOptions = {}) {
     const transport = new UdpEndpoint({
       logComponent: 'dtls:udp',
       type: host.includes(':') ? 'udp6' : 'udp4',
+      recvBufferSize: options.recvBufferSize || (1 << 20),
+      sendBufferSize: options.sendBufferSize || 0,
     });
 
     let settled = false;

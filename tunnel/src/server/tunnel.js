@@ -462,7 +462,7 @@ class Tunnel extends EventEmitter {
     }
 
     const stream = this.mux.openStream({
-      appId: app.appId, remoteAddress, remotePort,
+      appId: app.appId, remoteAddress, remotePort, qos: app.qos,
     });
     if (!stream) { app.refusedConnections++; return null; }
 
@@ -593,6 +593,12 @@ class Tunnel extends EventEmitter {
         pacingRateBps: mux.pacingRateBps,
         congestionWindow: mux.congestionWindow,
         bytesInFlight: mux.bytesInFlight,
+        // Sıralamanın gerçekten işleyip işlemediği buradan okunur: kanal
+        // kuyruğu izin verilenin sınırındaysa besleme doğru frenleniyor
+        // demektir; bandlara göre dağılım da hangi sınıfın beklediğini gösterir.
+        channelQueuedBytes: mux.channelQueuedBytes,
+        queueAllowanceBytes: mux.queueAllowanceBytes,
+        queuedByBand: mux.queuedByBand,
         packetsSent: mux.packetsSent,
         packetsLost: mux.packetsLost,
         retransmits: mux.retransmits,
