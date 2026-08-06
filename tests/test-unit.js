@@ -34,7 +34,7 @@ const { HsReassembler } = require('../src/handshake/reassembler.js');
 const { CookieMinter } = require('../src/handshake/cookie.js');
 const { Transcript, Transcript12 } = require('../src/handshake/transcript.js');
 const { SrtpContext, demuxPacket, rtpHeaderLength, estimateIndex } = require('../src/record/srtp.js');
-const { ReliableChannel } = require('../src/reliable/channel.js');
+const { ReliableChannel, DEFAULTS } = require('../src/reliable/channel.js');
 const der = require('../src/crypto/der.js');
 const x509mod = require('../src/crypto/x509.js');
 const revocationMod = require('../src/crypto/revocation.js');
@@ -870,6 +870,33 @@ const makeRtp = (seq, ssrc, payload) => {
     assert.throws(() => normalizeOptions('client', {
       rejectUnauthorized: false, srtp: true, reliable: true,
     }), /aynı anda kullanılamaz/);
+  });
+
+  await r.test('options: alıcı bellek tavanları kanala ULAŞIR', () => {
+    // Gerileme testi: normalizeReliable bir beyaz liste üretiyor, bu iki alan
+    // listede yoktu ve sessizce düşüyordu. Tünel 1/8 MiB istiyor, kanal 16/64
+    // MiB varsayılanıyla çalışıyordu — yapılandırma korunduğunu söylerken.
+    const o = normalizeOptions('client', {
+      rejectUnauthorized: false,
+      reliable: { maxMessageBytes: 1024 * 1024, maxReassemblyBytes: 8 * 1024 * 1024 },
+    });
+    assert.equal(o.reliable.maxMessageBytes, 1024 * 1024);
+    assert.equal(o.reliable.maxReassemblyBytes, 8 * 1024 * 1024);
+
+    // Verilmediğinde undefined kalmalı: kanal açık `undefined` değerleri
+    // atlayıp kendi varsayılanını koruyor, bu yüzden burada bir sayı
+    // uydurmak varsayılanı iki yere kopyalamak olurdu.
+    const bare = normalizeOptions('client', { rejectUnauthorized: false, reliable: true });
+    assert.equal(bare.reliable.maxMessageBytes, undefined);
+
+    const ch = new ReliableChannel({ send() {}, ...bare.reliable });
+    assert.equal(ch.opts.maxMessageBytes, DEFAULTS.maxMessageBytes);
+
+    for (const bad of [0, -1, NaN, Infinity]) {
+      assert.throws(() => normalizeOptions('client', {
+        rejectUnauthorized: false, reliable: { maxMessageBytes: bad },
+      }), /pozitif bir bayt sayısı/);
+    }
   });
 
   await r.test('options: srtp profil isimleri çözülür', () => {

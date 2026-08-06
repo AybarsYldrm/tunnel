@@ -23,15 +23,17 @@ sertifikaya bağlanması ve iptal durumunun OCSP/CRL ile denetlenmesi.
 1. [Neden bu tasarım](#neden-bu-tasarım)
 2. [Hızlı başlangıç](#hızlı-başlangıç)
 3. [Protokol](#protokol--ftp-v1)
-4. [Akış denetimi ve adil sıralama](#akış-denetimi-ve-adil-sıralama)
-5. [Port havuzu](#port-havuzu)
-6. [DoS / DDoS koruması](#dos--ddos-koruması)
-7. [Kimlik ve güven zinciri](#kimlik-ve-güven-zinciri)
-8. [Yönetim yüzeyi](#yönetim-yüzeyi)
-9. [Kalıcılık](#kalıcılık)
-10. [Yapılandırma](#yapılandırma)
-11. [Testler](#testler)
-12. [Kapsam dışı](#kapsam-dışı)
+4. [Hizmet sınıfı (QoS) ve öncelik](#hizmet-sınıfı-qos-ve-öncelik)
+5. [Akış denetimi ve adil sıralama](#akış-denetimi-ve-adil-sıralama)
+6. [Port havuzu](#port-havuzu)
+7. [DoS / DDoS koruması](#dos--ddos-koruması)
+8. [Sertleştirme](#sertleştirme)
+9. [Kimlik ve güven zinciri](#kimlik-ve-güven-zinciri)
+10. [Yönetim yüzeyi](#yönetim-yüzeyi)
+11. [Kalıcılık](#kalıcılık)
+12. [Yapılandırma](#yapılandırma)
+13. [Testler](#testler)
+14. [Kapsam dışı](#kapsam-dışı)
 
 ---
 
@@ -315,6 +317,94 @@ sahibine** geri verilir.
 Yasak bittiğinde **ihlal geçmişi silinmez** (varsayılan 1 saat hatırlanır).
 Silinseydi üstel yasak diye bir şey olmazdı: saldırgan kısa yasağın bitmesini
 bekler, aynı şeyi yapar, yine aynı kısa yasağı yerdi.
+
+---
+
+## Sertleştirme
+
+Yukarıdaki tablo hacim saldırılarını kapatıyor. Bu bölüm onun altındaki katmanı
+anlatıyor: **korunduğunu sandığın halde korunmadığın** durumları. Hepsi bu
+depoda gerçekten bulunmuş ve kapatılmış açıklar; sıraları "ne kadar sessizce
+başarısız oluyordu"ya göre.
+
+### 1. Adres kanonikleştirme — sessizce çalışmayan engel
+
+Node, çift yığınlı bir soketten gelen IPv4 bağlantısını `::ffff:203.0.113.7`,
+tek yığınlıdan geleni `203.0.113.7` olarak verir. IPv6 gösterimi ayrıca
+sıkıştırılabilir ve büyük/küçük harf serbesttir — `2001:DB8:0:0:0:0:0:1` ile
+`2001:db8::1` aynı adrestir.
+
+Engelleme, yasaklama ve kaynak başına sayaçların tamamı **dize karşılaştırması**
+yapıyor. Yönetici panelde `203.0.113.7` yazıyor, kayıt öyle saklanıyor, gelen
+bağlantı `::ffff:203.0.113.7` görünüyor, eşleşme olmuyordu. Engel hata
+vermiyordu — **hiçbir şey yapmıyordu.** Aynı ayrışma hız sayaçlarını da ikiye
+bölüp kaynak başına sınırları etkisizleştiriyordu.
+
+`canonicalIp()` (`protocol/codec.js`) adresi ikiliye çevirip RFC 5952 metnine
+geri yazıyor. Adres alan **her** yol — `Guard`'ın tüm metotları, `PeerRegistry`,
+engel listesi — girdiyi önce oradan geçiriyor.
+
+### 2. IP ayrıştırmada `Number()` gevşekliği
+
+`Number('')` sıfır verir. Yani `'203.0.113.'` dört parçaya bölünüp dördüncüsü
+sıfır sayılıyor, adres **geçerli** görünüyordu. `Number('0x10')` on altı,
+`Number(' 7 ')` yedi verir. Bu fonksiyon aynı zamanda "bu bir IP mi" sorusunun
+tek yanıtlayıcısı: engel listesi girdisini o doğruluyor. Yazım hatası içeren bir
+kaydı kabul etmek, **engellenmiş görünen ama hiçbir şeyi engellemeyen** bir
+kural üretiyordu. Artık her parça `/^\d{1,3}$/` ile sınanıyor.
+
+### 3. Alıcı belleği gönderenin elinde
+
+Bir DATA çerçevesi `count` alanında 65535 parça bildirebilir ve her parça MTU
+kadar olabilir: tek mesajda ~78 MB, eşzamanlı mesajlarla gigabaytlar. Parça
+sayısını sınırlamak yetmiyor, gelen baytları da saymak gerekiyor; ikisi ayrı
+ayrı aşılabilir. Kanal artık her ikisini de tutuyor (`maxMessageBytes`,
+`maxReassemblyBytes`) ve tavana değdiğinde bağlantıyı düşürmek yerine en eski
+yarım mesajı atıyor.
+
+Tünel bu tavanları kendi gerçek kullanımına çekiyor — kanala segment boyutundan
+(16 KiB) büyük bir mesaj vermiyor, en büyüğü 256 KiB'lık APP_SYNC:
+
+```js
+maxMessageBytes: 1024 * 1024,         // kütüphane varsayılanı 16 MiB
+maxReassemblyBytes: 8 * 1024 * 1024,  // kütüphane varsayılanı 64 MiB
+```
+
+> Bu iki alan bir süre **hiç uygulanmıyordu.** `normalizeOptions` güvenilir
+> kanal seçenekleri için bir beyaz liste üretiyor ve listede yoktular; sessizce
+> düşüyor, kanal kütüphane varsayılanına dönüyordu. Yapılandırma dosyası 1 MiB
+> diyor, çalışan sistem 16 MiB kullanıyordu. Sessizce gevşeyen bir güvenlik
+> sınırı hiç olmayanından beterdir — bakan kişi korunduğunu sanır.
+> `tests/test-unit.js` içindeki gerileme testi tavanın kanala ulaştığını
+> doğruluyor.
+
+### 4. Kimlik doğrulamadan önce büyüyen tablolar
+
+`/login` kimlik doğrulaması gerektirmiyor — gerektiremez de, giriş akışını o
+başlatıyor. Her çağrı bir PKCE akış kaydı üretiyordu ve kayıt yalnızca akış
+tamamlanınca ya da zaman aşımıyla siliniyordu. Hiç tamamlamayan bir istemci
+tabloyu istediği kadar büyütebiliyordu. Aynı şey SSE bağlantıları için de
+geçerli: her açık istemci bir olay kuyruğu tutuyor.
+
+| Sınır | Değer | Kapattığı |
+|---|---|---|
+| `MAX_PENDING_FLOWS` | 512 | Tamamlanmayan giriş akışlarıyla bellek şişirme |
+| `MAX_SESSIONS` | 256 | Oturum tablosunun sınırsız büyümesi |
+| `MAX_SSE_CLIENTS` | 64 | Olay akışı bağlantılarıyla kuyruk biriktirme |
+
+Tavana değildiğinde **en eski kayıt düşürülür**, yeni istek reddedilmez.
+Reddetmek, saldırganın tabloyu doldurup meşru girişleri kilitlemesine izin
+verirdi — yani bir DoS'u kapatırken başkasını açardı.
+
+### 5. CSP yapılandırmayla gevşetilemez
+
+`buildCsp()` politikayı kurarken `'unsafe-inline'`, `'unsafe-eval'` ve
+`'unsafe-hashes'` anahtarlarını **yapılandırmadan gelseler bile** eliyor.
+Panelde tek bir satıriçi `style="..."` ya da `<script>` yok; dinamik stiller
+CSSOM üzerinden (`element.style.setProperty`) veriliyor — CSSOM `style-src`
+kapsamı dışındadır, satıriçi `style` özniteliği değildir. Ayrıntı ve Cloudflare
+beacon'ın nasıl açılacağı için bkz. [İçerik güvenliği
+politikası](#i̇çerik-güvenliği-politikası).
 
 ---
 

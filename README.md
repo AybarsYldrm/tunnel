@@ -406,6 +406,10 @@ const reliable = {
   maxRetransmits: 12,         // parça başına vazgeçme sınırı
   initialRtt: 333,            // RTT örneği alınana kadarki tahmin (ms)
   ackDelay: 10,               // ACK'leri toplama gecikmesi (ms)
+
+  // Alıcı bellek tavanları — gönderenin bildirdiği parça sayısına güvenilmez.
+  maxMessageBytes: 16 * 1024 * 1024,     // tek mesaj
+  maxReassemblyBytes: 64 * 1024 * 1024,  // tüm yarım mesajların toplamı
 };
 
 const sock = await dtls.connect({ host, port, ca, reliable });
@@ -715,6 +719,10 @@ bilinçli olarak **yoktur**.
   handshake seli sınırlandırılır.
 * **Replay koruması.** Epoch başına 64 genişliğinde kayan pencere; SRTP'de SSRC
   başına ayrı pencere.
+* **Alıcı bellek tavanı.** Güvenilir kanalda birleştirme belleği, gönderenin
+  bildirdiği parça sayısına bırakılmaz: hem tek mesaj (`maxMessageBytes`) hem
+  tüm eşzamanlı birleştirmelerin toplamı (`maxReassemblyBytes`) ayrı ayrı
+  sınırlıdır. Tavan aşıldığında bağlantı düşmez, en eski yarım mesaj atılır.
 * **Sabit hata mesajları.** AEAD başarısızlıkları hangi aşamada olduğunu
   sızdırmayan tek bir mesaj döndürür.
 * **Anahtar materyali loglanmaz.** Tanılama günlükleri hiçbir seviyede gizli

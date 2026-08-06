@@ -240,8 +240,25 @@ function normalizeReliable(reliable, mtu) {
     maxRetransmits: base.maxRetransmits,
     maxTrackedPackets: pick(base.maxTrackedPackets, base.maxInFlight),
     maxReassembly: base.maxReassembly,
+    // Alıcı bellek tavanları. Bu iki alanın burada AKTARILMASI şart: bu
+    // fonksiyon bir beyaz liste üretiyor, yani yazılmayan her seçenek sessizce
+    // düşüyor. Düştüklerinde kanal kütüphane varsayılanına (16/64 MiB) geri
+    // dönüyordu — çağıran daha dar bir tavan istemiş olsa bile, hiçbir uyarı
+    // vermeden. Sessizce gevşeyen bir güvenlik sınırı, hiç olmayanından beterdir:
+    // yapılandırmaya bakan kişi korunduğunu sanır.
+    maxMessageBytes: positiveBytes(base.maxMessageBytes, 'reliable.maxMessageBytes'),
+    maxReassemblyBytes: positiveBytes(base.maxReassemblyBytes, 'reliable.maxReassemblyBytes'),
     maxOrderedBuffer: base.maxOrderedBuffer,
   };
+}
+
+/** Tavan olarak anlamlı olan tek değer aralığı: pozitif, sonlu, tam sayı. */
+function positiveBytes(value, name) {
+  if (value === undefined) return undefined;
+  if (!Number.isFinite(value) || value < 1) {
+    throw new TypeError(`${name}: pozitif bir bayt sayısı olmalı`);
+  }
+  return Math.floor(value);
 }
 
 function versionList(minVersion, maxVersion) {
