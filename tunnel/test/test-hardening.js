@@ -198,6 +198,50 @@ const noopLog = {
     ch.close();
   });
 
+  await r.test('sıralı teslim tamponunun BAYT tavanı var', () => {
+    // Eski hâlde yalnızca MESAJ SAYISI sınırlıydı. Mesaj başına tavan 16 MiB
+    // olduğu için tek bir akışta gigabaytlarca tampon açılabiliyordu ve bunu
+    // tetikleyen taraf UZAKTAKİ EŞTİ: sırayı bilerek bozup (ilk mesajı hiç
+    // göndermeyip) arkasındakileri yığmak yeterli.
+    const ch = new ReliableChannel({
+      mtu: 300, ordered: true, send: () => {},
+      maxOrderedBuffer: 10_000, maxOrderedBytes: 64 * 1024,
+    });
+
+    const delivered = [];
+    const gaps = [];
+    ch.on('message', (d) => delivered.push(d.length));
+    ch.on('gap', (g) => gaps.push(g));
+
+    // msgId 1 HİÇ gelmiyor: 2..N sıralı teslim tamponunda birikir.
+    for (let msgId = 2; msgId <= 200; msgId++) {
+      ch._deliver(7, msgId, Buffer.alloc(1024), true);
+    }
+
+    assert.ok(gaps.length > 0, 'bayt tavanı aşılınca sıra atlanmalı');
+    assert.ok(ch.orderedBytes <= 64 * 1024,
+              `sıralı tampon tavanı aşılmamalı: ${ch.orderedBytes}`);
+  });
+
+  await r.test('sıralı tampon muhasebesi teslimde ve kapanışta sızdırmaz', () => {
+    const ch = new ReliableChannel({ mtu: 300, ordered: true, send: () => {} });
+    ch.on('message', () => {});
+
+    // Sırayla gelen mesajlar hiç birikmez.
+    for (let msgId = 1; msgId <= 20; msgId++) {
+      ch._deliver(3, msgId, Buffer.alloc(2048), true);
+    }
+    assert.equal(ch.orderedBytes, 0, 'teslim edilen bayt sayaçtan düşmeli');
+
+    // Sırası gelmeyenler birikir; akış bırakılınca payları geri verilmeli.
+    // Aksi hâlde kapanan her akış tavandan kalıcı bir pay götürür ve tavan
+    // yavaşça tükenir — teşhisi en zor arıza türü.
+    ch._deliver(4, 5, Buffer.alloc(4096), true);
+    assert.equal(ch.orderedBytes, 4096);
+    ch._dropOrderedState(4);
+    assert.equal(ch.orderedBytes, 0);
+  });
+
   await r.test('datagram çözücüsü sınırsız tampon biriktirmez', () => {
     const d = new DatagramDeframer({ maxBuffered: 4096 });
     // Hiç tamamlanmayan bir uzunluk bildirip beslemeye devam etmek.

@@ -525,6 +525,23 @@ Uygulanan BBRv3 mekanizmaları:
   penceresi. Ölçüm `timerLagMs` olarak raporlanır.
 * **Uygulama sınırı işaretleme** — gönderilecek veri kalmadığında örnekler
   `app-limited` damgalanır; aksi hâlde BBR, boş kalan hattı yavaş bir hat sanar.
+  **Ama kuyruğun boşalması tek başına bu anlama GELMEZ**: üst katman kuyruğu
+  bilerek kısa tutuyor ya da akış denetimi penceresi kapanmış olabilir. Kanal bu
+  yüzden `setPendingSource()` ile üst katmana sorar; elinde veri varsa işaret
+  konmaz. Konsaydı BBR başlangıç evresini hiç tamamlamaz, `inflight_hi` hiç
+  kurulmaz ve ilk rastgele kayıp serisi pencereyi ölçülmemiş bir tavana
+  kilitlerdi — hızın kademeli olarak çökmesi (18 → 6 Mbit) tam olarak budur.
+* **Zaman eksenli darboğaz süzgeci** — `getBottleneckBandwidth()` anlık teslim
+  hızı örneğini değil, son 10 saniyenin GERÇEK maksimumunu verir. Yapı,
+  `Float64Array` üzerinde halka tampon kullanan tek yönlü bir kuyruktur: sıcak
+  yolda tahsis yok, maliyet O(1) amorti. Eksen tur/çevrim sayacı DEĞİL zamandır;
+  sayaç ilerlemediğinde (başlangıç evresinde takılma) çevrim eksenli bir süzgeç
+  hiç kaymaz ve bayat bir tepe kalıcılaşır.
+* **Monotonik saat** — RTT, teslim hızı ve jeton dolumunun tamamı
+  `performance.now()` üzerinden ölçülür. `Date.now()`'un tam sayı milisaniye
+  çözünürlüğü, birkaç milisaniyelik teslim aralıklarında ±%33 hata demekti ve
+  pencereli maksimum bu hatanın sistematik olarak yukarı sapan ucunu seçiyordu.
+  Duvar saati ayrıca NTP düzeltmesiyle geriye gidebilir; monotonik saat gitmez.
 
 `newreno` hâlâ tam olarak destekleniyor ve RFC 9002 §7 sözleşmesini birebir
 uyguluyor:

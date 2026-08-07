@@ -30,7 +30,7 @@
 //   PONG 0x04 | token(4)
 
 const { EventEmitter } = require('node:events');
-const { performance } = require('node:perf_hooks');
+const { now: monotonicNow } = require('./clock.js');
 const { LossRecovery, DEFAULT_CONGESTION_CONTROL } = require('./recovery.js');
 
 const FRAME = Object.freeze({ RAW: 0x00, DATA: 0x01, ACK: 0x02, PING: 0x03, PONG: 0x04 });
@@ -77,7 +77,25 @@ const DEFAULTS = Object.freeze({
    */
   maxMessageBytes: 16 * 1024 * 1024,
   maxReassemblyBytes: 64 * 1024 * 1024,
-  maxOrderedBuffer: 128,   // sıralı modda bekletilecek mesaj sayısı
+  /**
+   * Sıralı modda bekletilecek mesaj SAYISI ve TOPLAM BAYTI.
+   *
+   * İkisi ayrı ayrı gerekli ve eskiden yalnızca ilki vardı — bu bir bellek
+   * açığıydı: 128 mesaj sınırı, mesaj başına `maxMessageBytes` (16 MiB) ile
+   * birleştiğinde tek bir akışta 2 GB'lık bir tampona izin veriyordu ve bunu
+   * tetikleyen taraf UZAKTAKİ EŞTİ (sırayı bilerek bozup mesajları biriktirmek
+   * yeterli). Reassembly tarafında aynı hata zaten kapatılmıştı; burada
+   * kapalı değildi.
+   *
+   * Sayı sınırı neden yükseltildi: sınır aşıldığında kanal sırayı ZORLA atlar
+   * ve o akıştaki veri bütünlüğü biter. Uçuştaki mesaj sayısı akış denetimi
+   * penceresi ÷ segment kadardır; 128, 2 MiB'lik bir pencerede aşılır. Pencere
+   * artık BDP'ye göre otomatik ayarlandığı için (tunnel/protocol/constants.js
+   * STREAM_WINDOW_MAX = 16 MiB, segment 16 KiB → 1024 mesaj) sayaç ona göre
+   * kurulur. Gerçek tavan artık bayt sınırıdır.
+   */
+  maxOrderedBuffer: 1024,
+  maxOrderedBytes: 32 * 1024 * 1024,
   maxDedupeEntries: 8192,  // teslim edilmiş mesaj kimlikleri (yineleme eleme)
   maxAckRanges: 32,
   /** 'bbr3' | 'newreno' — gerekçeler reliable/congestion.js başında. */
@@ -101,6 +119,23 @@ const MAX_PACING_TIMER_MS = 250;
  * hiçbir veri bloğu sığmaz.
  */
 const MAX_EXPEDITE_CHUNKS = 4;
+
+/**
+ * Gönderimin NEDEN durduğu. BBR'ın "uygulama sınırlı mıyım" kararı buna bakar;
+ * gerekçe `_noteSendLimit`'te.
+ */
+const LIMIT = Object.freeze({
+  /** Durmadı — kuyrukta iş var ve gönderilmeye devam ediyor. */
+  NONE: 'none',
+  /** Kuyruk boşaldı. Uygulama sınırı OLABİLİR — üst katmana sorulur. */
+  DRAINED: 'drained',
+  /** Tıkanıklık penceresi dolu: ACK bekleniyor. Ağ sınırı. */
+  CWND: 'cwnd',
+  /** Hız şekillendirici jeton bekliyor. Kendi politikamız. */
+  PACING: 'pacing',
+  /** İzlenen paket tavanı (bellek koruması). */
+  TRACKING: 'tracking',
+});
 
 // Alıcı, iki ACK bekleyen paketten sonra ACK'i geciktirmeden gönderir
 // (RFC 9000 §13.2.1) — kurtarma turunu kısaltan en ucuz iyileştirme.
@@ -157,6 +192,10 @@ class ReliableChannel extends EventEmitter {
     this.timer = null;
     this.timerAt = 0;
     this.pacingTimer = null;
+    /** Son pompa turunda gönderimi durduran sınır (LIMIT). */
+    this.sendLimit = LIMIT.NONE;
+    /** Üst katmanın elinde tuttuğu bayt — `setPendingSource` ile kurulur. */
+    this.pendingBytes = null;
 
     // --- alıcı durumu
     this.ackRanges = [];             // [[start,end], ...] artan, birleştirilmiş
@@ -167,6 +206,7 @@ class ReliableChannel extends EventEmitter {
     this.reassembly = new Map();     // "stream:msg" -> parça toplayıcı
     this.reassemblyBytes = 0;        // tüm yarım mesajların toplamı
     this.orderedState = new Map();   // streamId -> { next, buffer }
+    this.orderedBytes = 0;           // sıralı tamponların TOPLAMI (bellek tavanı)
     this.delivered = new Set();      // "stream:msg" -> teslim edildi (yineleme eleme)
 
     this.stats = {
@@ -191,6 +231,10 @@ class ReliableChannel extends EventEmitter {
       ...this.recovery.snapshot(),
       queued: this.queuedCount,
       queuedByPriority: this.sendBands.map((b) => b.length),
+      orderedBytes: this.orderedBytes,
+      /** Gönderimi durduran son sınır — teşhisin başlangıç noktası. */
+      sendLimit: this.sendLimit,
+      upperPendingBytes: this.pendingBytes ? this.pendingBytes() : null,
     };
   }
 
@@ -370,20 +414,24 @@ class ReliableChannel extends EventEmitter {
    */
   _pump() {
     if (this.closed) return;
-    const now = Date.now();
+    const now = monotonicNow();
+    this.sendLimit = LIMIT.NONE;
 
     for (;;) {
       const key = this._peek();
-      if (key === null) break;
+      if (key === null) { this.sendLimit = LIMIT.DRAINED; break; }
       const chunk = this.chunks.get(key);
       if (!chunk) { this._dequeue(); continue; }
 
       const size = DATA_HEADER_LEN + chunk.payload.length;
-      if (!this.recovery.hasCongestionRoom(size)) break;
-      if (this.recovery.sent.size >= this.opts.maxTrackedPackets) break;
+      if (!this.recovery.hasCongestionRoom(size)) { this.sendLimit = LIMIT.CWND; break; }
+      if (this.recovery.sent.size >= this.opts.maxTrackedPackets) {
+        this.sendLimit = LIMIT.TRACKING;
+        break;
+      }
 
       const wait = this.recovery.pacingDelay(size, now);
-      if (wait > 0) { this._armPacingTimer(wait); break; }
+      if (wait > 0) { this.sendLimit = LIMIT.PACING; this._armPacingTimer(wait); break; }
 
       this._dequeue();
       // Turun damgası aşağı geçirilir: şekillendiricinin "izin var mı" ve
@@ -391,12 +439,56 @@ class ReliableChannel extends EventEmitter {
       this._transmit(chunk, now);
     }
 
-    // Kuyruk boşaldı: bundan sonraki teslim hızı örnekleri AĞIN değil
-    // uygulamanın hızını ölçer. İşaretlenmezse BBR, veri veremediğimiz için
-    // boş kalan hattı yavaş bir hat sanar ve tahmini kalıcı olarak düşer.
-    if (this.queuedCount === 0) this.recovery.markAppLimited();
-
+    this._noteSendLimit();
     this._rearmTimer();
+  }
+
+  /**
+   * "Neden daha fazla gönderemedim" sorusunun cevabını BBR'a aktarır.
+   *
+   * ÖLÜM SARMALININ KAYNAĞI TAM OLARAK BU KARARDI.
+   *
+   * Eski davranış tek satırdı: kuyruk boşaldıysa `markAppLimited()`. O çağrı
+   * BBR'a "uygulamanın gönderecek verisi kalmadı, bundan sonraki teslim hızı
+   * örnekleri AĞI değil UYGULAMAYI ölçüyor" der. Doğru bir mekanizmadır —
+   * ama kuyruğun boşalmasının tek sebebi uygulamanın susması DEĞİLDİR:
+   *
+   *   • Çoklayıcı kuyruğu bilerek kısa tutar (`targetQueueMs`). Kuyruk sürekli
+   *     boşalır; üst katmanda megabaytlarca veri beklerken.
+   *   • Akış denetimi penceresi kapanmış olabilir — karşı taraf yetişemiyordur.
+   *   • Hız şekillendirici jeton bekliyordur.
+   *
+   * Üçünde de veri VARDIR. "Uygulama sınırlı" demek, BBR'ın şu üç davranışını
+   * birden tetikler: başlangıç evresi tamamlanmaz (`fullBwCount` artmaz),
+   * `inflight_hi` hiç kurulmaz, kayıp turları modelden dışlanır. Aktarım
+   * saatlerce başlangıç evresinde asılı kalır; sonunda rastgele bir kayıp
+   * serisi çıkışı zorladığında tavan, HİÇ ÖLÇÜLMEMİŞ bir kapasiteden türetilir
+   * ve pencere çöker. Ölçümde 17 Mbit → 6 Mbit olarak görünen kilitlenme budur.
+   *
+   * Ayrım bu yüzden kaynağında yapılır: kuyruk boşaldığında ÜST KATMANA
+   * sorulur. Elinde veri varsa bu bir uygulama sınırı değil, bizim kendi
+   * politikamızın (kuyruk hedefi / pencere / şekillendirici) sonucudur ve
+   * BBR'ın modelini dondurmaması gerekir.
+   */
+  _noteSendLimit() {
+    if (this.sendLimit !== LIMIT.DRAINED) return;   // pencere/hız/tavan sınırı
+    // Üst katman veri tutuyorsa "uygulama sınırlı" DEĞİLİZ.
+    if (this.pendingBytes !== null && this.pendingBytes() > 0) return;
+    this.recovery.markAppLimited();
+  }
+
+  /**
+   * Üst katmanın (çoklayıcının) kanala VERMEDİĞİ ama elinde tuttuğu bayt
+   * sayısını okuyan işlev.
+   *
+   * İşlev olarak alınır, sayı olarak değil: değer her pompa turunda ve akış
+   * başına değişir; senkron tutmaya çalışmak iki sayacın kaçınılmaz olarak
+   * ayrışması demek olurdu. Verilmezse davranış eskisiyle aynıdır.
+   *
+   * @param {(() => number)|null} fn
+   */
+  setPendingSource(fn) {
+    this.pendingBytes = typeof fn === 'function' ? fn : null;
   }
 
   /**
@@ -411,10 +503,10 @@ class ReliableChannel extends EventEmitter {
   _armPacingTimer(ms) {
     if (this.pacingTimer || this.closed) return;
     const delay = Math.max(1, Math.min(Math.ceil(ms), MAX_PACING_TIMER_MS));
-    const armedAt = performance.now();
+    const armedAt = monotonicNow();
     this.pacingTimer = setTimeout(() => {
       this.pacingTimer = null;
-      this.recovery.noteTimerWake(delay, performance.now() - armedAt);
+      this.recovery.noteTimerWake(delay, monotonicNow() - armedAt);
       this._pump();
     }, delay);
     if (this.pacingTimer.unref) this.pacingTimer.unref();
@@ -457,7 +549,7 @@ class ReliableChannel extends EventEmitter {
    * doldurur. İkisi farklı damgalar kullanırsa kova aynı zaman aralığını iki
    * kez sayabilir ve şekillendirme hedeflenen hızın üstüne çıkar.
    */
-  _transmit(chunk, now = Date.now()) {
+  _transmit(chunk, now = monotonicNow()) {
     const pn = this.nextPn++;
     const frame = Buffer.allocUnsafe(DATA_HEADER_LEN + chunk.payload.length);
     frame[0] = FRAME.DATA;
@@ -507,7 +599,7 @@ class ReliableChannel extends EventEmitter {
 
     this._clearTimer();
     this.timerAt = at;
-    const delay = Math.max(1, at - Date.now());
+    const delay = Math.max(1, at - monotonicNow());
     this.timer = setTimeout(() => { this.timer = null; this._onTimeout(); }, delay);
     if (this.timer.unref) this.timer.unref();
   }
@@ -519,7 +611,7 @@ class ReliableChannel extends EventEmitter {
 
   _onTimeout() {
     if (this.closed) return;
-    const now = Date.now();
+    const now = monotonicNow();
     const { lost, probes } = this.recovery.onLossDetectionTimeout(now);
 
     if (lost.length) this._handleLost(lost);
@@ -746,9 +838,16 @@ class ReliableChannel extends EventEmitter {
     if (!st) { st = { next: 1, buffer: new Map() }; this.orderedState.set(streamId, st); }
 
     if (msgId < st.next) return;                  // geç kalmış yineleme
+    if (!st.buffer.has(msgId)) this.orderedBytes += data.length;
     st.buffer.set(msgId, data);
-    if (st.buffer.size > this.opts.maxOrderedBuffer) {
-      // Sıra hiç kapanmıyorsa (kalıcı kayıp) en küçük bekleyene atla.
+
+    // İKİ TAVAN, İKİ FARKLI TEHDİT: sayı, sıranın hiç kapanmadığı durumu
+    // (kalıcı kayıp) bağlar; bayt, karşı tarafın sırayı bilerek bozarak
+    // belleğimizi doldurmasını bağlar. Biri diğerinin yerine geçemez.
+    if (st.buffer.size > this.opts.maxOrderedBuffer
+        || this.orderedBytes > this.opts.maxOrderedBytes) {
+      // Sıra hiç kapanmıyorsa en küçük bekleyene atla. Bu, o akıştaki veri
+      // bütünlüğünün SONUdur: üst katman akışı düşürmek zorunda kalır.
       const lowest = Math.min(...st.buffer.keys());
       st.next = lowest;
       this.emit('gap', { streamId, skippedTo: lowest });
@@ -756,9 +855,18 @@ class ReliableChannel extends EventEmitter {
     while (st.buffer.has(st.next)) {
       const d = st.buffer.get(st.next);
       st.buffer.delete(st.next);
+      this.orderedBytes -= d.length;
       this.emit('message', d, { streamId, msgId: st.next, ordered: true });
       st.next++;
     }
+  }
+
+  /** Bir akışın sıralı teslim tamponunu bırakır (akış kapandığında). */
+  _dropOrderedState(streamId) {
+    const st = this.orderedState.get(streamId);
+    if (!st) return;
+    for (const d of st.buffer.values()) this.orderedBytes -= d.length;
+    this.orderedState.delete(streamId);
   }
 
   // ==========================================================================
@@ -766,7 +874,7 @@ class ReliableChannel extends EventEmitter {
   // ==========================================================================
   /** @returns {boolean} bu paket numarası ilk kez mi görüldü */
   _recordReceived(pn, ackEliciting) {
-    const now = Date.now();
+    const now = monotonicNow();
     if (pn > this.largestReceived) { this.largestReceived = pn; this.largestReceivedAt = now; }
 
     const isNew = this._insertRange(pn);
@@ -817,7 +925,12 @@ class ReliableChannel extends EventEmitter {
 
     // En yeni aralıklar en değerlisidir (gönderen onlara göre kayıp çıkarır).
     const ranges = this.ackRanges.slice(-16);
-    const ackDelay = Math.min(0xffff, Math.max(0, Date.now() - this.largestReceivedAt));
+    // Telde giden TEK zaman alanı ve bir SÜRE (damga değil): saat tabanından
+    // bağımsız. Monotonik saat kayan sayı döndüğü için tam sayıya yuvarlanır —
+    // `writeUInt16BE` kesirli değer kabul etmez.
+    const ackDelay = Math.round(
+      Math.min(0xffff, Math.max(0, monotonicNow() - this.largestReceivedAt)),
+    );
 
     const frame = Buffer.allocUnsafe(ACK_HEADER_LEN + ranges.length * ACK_RANGE_LEN);
     frame[0] = FRAME.ACK;
@@ -846,7 +959,7 @@ class ReliableChannel extends EventEmitter {
     }
     if (ranges.length === 0) return;
 
-    const { acked, lost } = this.recovery.onAckReceived({ ranges, ackDelay, now: Date.now() });
+    const { acked, lost } = this.recovery.onAckReceived({ ranges, ackDelay, now: monotonicNow() });
 
     for (const entry of acked) {
       if (!entry.meta) continue;
@@ -888,6 +1001,7 @@ class ReliableChannel extends EventEmitter {
     this.reassembly.clear();
     this.reassemblyBytes = 0;
     this.orderedState.clear();
+    this.orderedBytes = 0;
     this.delivered.clear();
     this.recovery.reset();
   }
@@ -905,5 +1019,5 @@ module.exports = {
   ReliableChannel, LossRecovery, FRAME,
   PRIORITY_BANDS, DEFAULT_PRIORITY, clampPriority,
   DATA_HEADER_LEN, ACK_HEADER_LEN, ACK_RANGE_LEN, PING_LEN, DEFAULTS,
-  MAX_EXPEDITE_CHUNKS, MAX_PACING_TIMER_MS,
+  MAX_EXPEDITE_CHUNKS, MAX_PACING_TIMER_MS, LIMIT,
 };

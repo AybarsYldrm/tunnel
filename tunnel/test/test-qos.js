@@ -18,8 +18,10 @@ const { Runner } = require('../../tests/helpers.js');
 const {
   Mux, STARVATION_GUARD_MS, normalizePriority,
 } = require('../src/common/mux.js');
-const { ReliableChannel } = require('../../src/reliable/channel.js');
-const { QOS, DATA, LIMITS } = require('../src/protocol/constants.js');
+const { ReliableChannel, LIMIT } = require('../../src/reliable/channel.js');
+const {
+  QOS, DATA, CTRL, LIMITS, SUPPORTED_FEATURES,
+} = require('../src/protocol/constants.js');
 const { normalizeApp, appToWire, appToPublic } = require('../src/server/app-model.js');
 
 const r = new Runner('tünel — hizmet sınıfı (QoS)');
@@ -497,6 +499,144 @@ function makeMux(sock, limits = {}) {
               'gecikmeye duyarlı yük sayılmalı');
     assert.ok(ch.recovery.pacer.tokens < before,
               'jeton harcanmalı: güvenilir taraf hattı boş sanmamalı');
+  });
+
+  // ========================================================================
+  // Uygulama sınırı köprüsü — ölüm sarmalının kaynağı
+  // ========================================================================
+  await r.test('kuyruk boşaldı diye "uygulama sınırlı" denmez', () => {
+    const ch = new ReliableChannel({ mtu: 300, send: () => {} });
+
+    // Üst katman veri TUTUYOR: kuyruğun boşalması bizim kendi frenimizin
+    // sonucudur, uygulamanın susmasının değil.
+    let pending = 512 * 1024;
+    ch.setPendingSource(() => pending);
+    ch._pump();
+    assert.equal(ch.sendLimit, LIMIT.DRAINED, 'kuyruk boş: sınır "drained" olmalı');
+    assert.equal(ch.recovery.isAppLimited, false,
+                 'üst katman veri tutarken uygulama sınırı işaretlenmemeli');
+
+    // Üst katmanın da işi bittiğinde işaret DOĞRU olur — mekanizma
+    // kaldırılmadı, yalnızca doğru koşula bağlandı.
+    pending = 0;
+    ch._pump();
+    assert.equal(ch.recovery.isAppLimited, true,
+                 'gerçekten veri kalmadıysa işaret konmalı');
+  });
+
+  await r.test('çoklayıcı bekleyen baytı O(1) ve sızdırmadan sayar', () => {
+    const sock = fakeSocket();
+    const mux = makeMux(sock);
+    assert.equal(mux.pendingBytes, 0);
+
+    const a = mux.openStream({ appId: 'web', qos: QOS.INTERACTIVE });
+    const b = mux.openStream({ appId: 'web', qos: QOS.BULK });
+    a.write(Buffer.alloc(2 * 1024 * 1024));
+    b.write(Buffer.alloc(2 * 1024 * 1024));
+    assert.equal(mux.pendingBytes, a.queuedBytes + b.queuedBytes,
+                 'sayaç akış kuyruklarının toplamına eşit kalmalı');
+
+    // Akış düşerse payı da düşer; kalmasaydı kanal sonsuza kadar "veri var"
+    // sanır ve uygulama sınırı bir daha hiç işaretlenmezdi.
+    a.reset();
+    assert.equal(mux.pendingBytes, b.queuedBytes);
+    mux.destroy();
+    assert.equal(mux.pendingBytes, 0);
+  });
+
+  // ========================================================================
+  // Pencere otomatik ayarı
+  // ========================================================================
+  await r.test('pencere yetenek uzlaşısı olmadan BÜYÜMEZ', () => {
+    // Yeni bir denetim çerçevesini eski bir eşe göndermek, onun protokol
+    // hatası sayıp tüneli kapatması demektir.
+    const sock = fakeSocket();
+    const mux = makeMux(sock);
+    const before = mux.localStreamWindow;
+    mux._streamWindowStarved = true;
+    mux._maybeTuneWindows(Date.now() + 10_000);
+    assert.equal(mux.localStreamWindow, before,
+                 'yetenek uzlaşılmadan pencere değiştirilmemeli');
+    assert.ok(!sock.sent.some((f) => f.frame[0] === CTRL.WINDOW),
+              'WINDOW çerçevesi gönderilmemeli');
+  });
+
+  await r.test('pencere tükendiği KANITLANINCA büyür ve tavanda durur', () => {
+    const sock = fakeSocket();
+    const mux = makeMux(sock);
+    mux.setFeatures(SUPPORTED_FEATURES);
+    mux.rttMs = 100;
+    mux.meterConsumed.add(4 * 1024 * 1024);
+
+    const first = mux.localStreamWindow;
+    let t = Date.now();
+    // Tükenme kanıtı olmadan da ölçüme göre büyüyebilir; asıl sınanan, kanıt
+    // geldiğinde takılmaması ve TAVANI aşmaması.
+    for (let i = 0; i < 40; i++) {
+      mux._streamWindowStarved = true;
+      t += LIMITS.WINDOW_TUNE_INTERVAL_MS + 1;
+      mux._maybeTuneWindows(t);
+    }
+    assert.ok(mux.localStreamWindow > first, 'kanıt geldiğinde pencere büyümeli');
+    assert.ok(mux.localStreamWindow <= LIMITS.STREAM_WINDOW_MAX,
+              `akış tavanı aşılmamalı: ${mux.localStreamWindow}`);
+    assert.ok(mux.localConnectionWindow <= LIMITS.CONNECTION_WINDOW_MAX,
+              'tünel geneli bellek tavanı aşılmamalı');
+    assert.ok(mux.localConnectionWindow >= mux.localStreamWindow,
+              'tünel penceresi akış penceresinden küçük olamaz');
+  });
+
+  await r.test('pencere ayarı KÜÇÜLTMEZ', () => {
+    // Küçültmek, karşı tarafın zaten kullanmakta olduğu bir taahhüdü geri
+    // almaktır: uçuştaki veri bir anda "pencere ihlali" hâline gelir.
+    const sock = fakeSocket();
+    const mux = makeMux(sock);
+    mux.setFeatures(SUPPORTED_FEATURES);
+    mux._applyPeerWindowUpdate({ streamWindow: 4 * 1024 * 1024, connectionWindow: 16 * 1024 * 1024 });
+    const grown = mux.peerStreamWindow;
+    assert.equal(grown, 4 * 1024 * 1024);
+
+    mux._applyPeerWindowUpdate({ streamWindow: 64 * 1024, connectionWindow: 64 * 1024 });
+    assert.equal(mux.peerStreamWindow, grown, 'küçültme yok sayılmalı');
+  });
+
+  await r.test('pencere büyümesi gönderene DELTA olarak yansır', () => {
+    const sock = fakeSocket();
+    const mux = makeMux(sock);
+    mux.setFeatures(SUPPORTED_FEATURES);
+    const s = mux.openStream({ appId: 'web', qos: QOS.INTERACTIVE });
+    s.write(Buffer.alloc(64 * 1024));
+    const used = mux.peerStreamWindow - s.sendWindow;
+    assert.ok(used > 0, 'akış penceresinin bir kısmını harcamış olmalı');
+
+    const before = s.sendWindow;
+    mux._applyPeerWindowUpdate({
+      streamWindow: mux.peerStreamWindow + 100_000,
+      connectionWindow: mux.peerConnectionWindow,
+    });
+    assert.equal(s.sendWindow, before + 100_000,
+                 'delta EKLENMELİ; tavanı atamak harcanmış baytı geri verirdi');
+  });
+
+  // ========================================================================
+  // Canlılık: tek yönlü yıkım yok
+  // ========================================================================
+  await r.test('sıra atlamasında karşı tarafa RST gider', () => {
+    // Akışı yalnızca yerelde düşürmek ölçülmüş bir KİLİTLENMEYDİ: kredi
+    // üretmeyi bırakırız, gönderen kapalı pencereyle sonsuza kadar bekler.
+    const sock = fakeSocket();
+    const mux = makeMux(sock);
+    const s = mux.openStream({ appId: 'web', qos: QOS.INTERACTIVE });
+    s.write(Buffer.alloc(64 * 1024));
+
+    const before = sock.sent.length;
+    mux._onGap({ streamId: s.id, skippedTo: 42 });
+
+    const rst = sock.sent.slice(before).find((f) => f.frame[0] === DATA.RST);
+    assert.ok(rst, 'sıra atlaması karşı tarafa bildirilmeli');
+    assert.equal(rst.opts.streamId, s.id);
+    assert.equal(s.closed, true);
+    assert.equal(mux.pendingBytes, 0, 'akışın kuyruk payı da düşmeli');
   });
 
   r.exit();

@@ -106,6 +106,39 @@ function encodeCredit(entries) {
   return w.done();
 }
 
+/**
+ * Alıcının pencere TAVANLARINI büyüttüğünü bildirir.
+ *
+ * KREDİDEN FARKI: kredi "az önce tükettiğim şu kadar baytı geri veriyorum"
+ * der ve tavanı değiştirmez. Bu çerçeve tavanın kendisini yükseltir — alıcı,
+ * ölçtüğü bant genişliği-gecikme çarpımına göre daha fazla bellek taahhüt
+ * etmiştir.
+ *
+ * SIRA GÜVENLİĞİ: alıcı ÖNCE kendi `recvWindow`unu büyütür, SONRA bu çerçeveyi
+ * gönderir. Denetim akışı güvenilir ve sıralı olduğu için gönderen, alıcının
+ * taahhüt etmediği bir pencereyi asla kullanamaz.
+ */
+const WINDOW_BLOCKED_FRAME = Buffer.from([CTRL.WINDOW_BLOCKED]);
+
+function encodeWindow({ streamWindow, connectionWindow }) {
+  return new Writer(12).u8(CTRL.WINDOW).u32(streamWindow).u32(connectionWindow).done();
+}
+
+/**
+ * "Senin pencerenin yüzünden duruyorum."
+ *
+ * NEDEN GEREKLİ: pencere darboğazını ALICI kendi başına göremez. Alıcının
+ * `recvWindow`u kredi üretilir üretilmez geri dolar; gönderenin `sendWindow`u
+ * ise o kredi TELDEN GELENE KADAR sıfırda bekler. Yani tıkanma yalnızca
+ * gönderende görünür. Alıcı taraf "tükeniyor muyum" diye kendine baktığında
+ * hep "hayır" cevabını alır ve pencereyi büyütmesi gerektiğini asla anlamaz.
+ *
+ * Çerçeve yükü taşımaz: tek bilgi, olayın kendisidir. Gönderen tarafta
+ * kısıtlanır (ayar aralığında en fazla bir kez), dolayısıyla tıkanmış bir
+ * aktarım denetim düzlemini dolduramaz.
+ */
+function encodeWindowBlocked() { return WINDOW_BLOCKED_FRAME; }
+
 function encodePing({ nonce, sentAt }) {
   return new Writer(12).u8(CTRL.PING).u32(nonce).u48(sentAt).done();
 }
@@ -203,6 +236,11 @@ function decodeControl(buf) {
       for (let i = 0; i < count; i++) entries[i] = [r.u16(), r.u32()];
       return { type, entries };
     }
+
+    case CTRL.WINDOW:
+      return { type, streamWindow: r.u32(), connectionWindow: r.u32() };
+    case CTRL.WINDOW_BLOCKED:
+      return { type };
 
     case CTRL.PING:
     case CTRL.PONG:
@@ -332,7 +370,7 @@ module.exports = {
 
   encodeHello, encodeHelloOk, encodeHelloErr,
   encodeBindReq, encodeBindOk, encodeBindErr, encodeUnbind, encodeAppSync,
-  encodeCredit, encodePing, encodePong,
+  encodeCredit, encodeWindow, encodeWindowBlocked, encodePing, encodePong,
   encodeStats, encodeConfig, encodeShutdown,
   decodeControl,
 

@@ -25,7 +25,7 @@
 const { EventEmitter } = require('node:events');
 
 const {
-  STREAM, CTRL, DATA, LIMITS, RST_CODE, QOS,
+  STREAM, CTRL, DATA, LIMITS, RST_CODE, QOS, FEATURES,
 } = require('../protocol/constants.js');
 const frames = require('../protocol/frames.js');
 const { CONNECTION_STREAM } = frames;
@@ -90,6 +90,17 @@ const FRESH_SCAN_LIMIT = 64;
  * yani bir akışın segmenti kuyruktayken diğeri kendi segmentini verebilir.
  */
 const QUEUE_FLOOR_MTUS = 1;
+/**
+ * Pencere tükendiği kanıtlandığında alım penceresinin çıkabileceği azami
+ * BDP katı.
+ *
+ * Tükenme sinyali "hız tahminim takıldı" der; "hat sonsuz" demez. Katlamayı
+ * ölçülmüş BDP'ye bağlamazsak alım penceresi tıkanıklık penceresinden
+ * bağımsız büyür ve kendisi bir tampon şişmesi kaynağı olur. Dört BDP,
+ * uçuştaki veriyi, yoldaki krediyi ve bir yoklama turunun fazlasını birlikte
+ * karşılar.
+ */
+const STARVED_BDP_CAP = 4;
 /** Kanalın MTU'su okunamazsa kullanılan güvenli varsayım. */
 const ASSUMED_MTU = 1200;
 /** Yazma kuyruğu bu boyutu aşınca `write()` false döner (geri basınç sinyali). */
@@ -150,6 +161,9 @@ class TunnelStream extends EventEmitter {
     if (!this.writable || this.closed || chunk.length === 0) return this.writable && !this.closed;
     this.queue.push(chunk);
     this.queuedBytes += chunk.length;
+    // Kanal, "üst katmanın elinde veri var mı" sorusunu BU sayaçtan okur;
+    // sayaç O(1) tutulmalı, akışlar taranarak değil (gerekçe: `pendingBytes`).
+    this.mux.pendingBytes += chunk.length;
     this.mux._activate(this);
     this.mux._pump();
     if (this.queuedBytes >= STREAM_HIGH_WATER) { this.needsDrain = true; return false; }
@@ -169,6 +183,7 @@ class TunnelStream extends EventEmitter {
   reset(code = RST_CODE.UNSPECIFIED) {
     if (this.closed) return;
     this.queue.length = 0;
+    this.mux.pendingBytes -= this.queuedBytes;
     this.queuedBytes = 0;
     this.writable = false;
     this.mux._sendOnStream(this, frames.frameRst(code), 0);
@@ -274,13 +289,46 @@ class Mux extends EventEmitter {
     this.quarantine = [];      // { id, until }
     this.poisoned = new Set(); // sıra atlaması yaşamış: bir daha kullanılmaz
 
+    /**
+     * Kanala VERİLMEMİŞ ama akış kuyruklarında bekleyen toplam bayt.
+     *
+     * Kanal, "uygulama gerçekten sustu mu yoksa ben mi frenledim" sorusunu
+     * buradan yanıtlar (`ReliableChannel._noteSendLimit`). Sayaç O(1) tutulur:
+     * her pompa turunda akışları taramak, tam da sıcak yolda O(n) bir iş
+     * olurdu.
+     */
+    this.pendingBytes = 0;
+
+    /**
+     * Karşı tarafla ortak yetenekler (FEATURES maskesi).
+     *
+     * Sıfır kalırsa hiçbir yeni denetim çerçevesi gönderilmez: eski bir eş
+     * tanımadığı tipi protokol hatası sayıp tüneli kapatır.
+     */
+    this.features = 0;
+    this.autoTuneWindows = limits.autoTuneWindows !== false;
+    this.maxStreamWindow = Math.min(
+      limits.maxStreamWindow || LIMITS.STREAM_WINDOW_MAX, LIMITS.STREAM_WINDOW_MAX,
+    );
+    this.maxConnectionWindow = Math.min(
+      limits.maxConnectionWindow || LIMITS.CONNECTION_WINDOW_MAX, LIMITS.CONNECTION_WINDOW_MAX,
+    );
+    this._lastTuneAt = 0;
+    this._channelBound = false;
+    /** Alım penceresi tükendi mi — otomatik ayarın doğrudan büyüme kanıtı. */
+    this._streamWindowStarved = false;
+    this._connWindowStarved = false;
+    this._lastBlockedAt = 0;
+    /** GERÇEKTEN tüketilen (yerel sokete yazılan) bayt hızı — ayarın girdisi. */
+    this.meterConsumed = new RateMeter(1000);
+
     this.meterIn = new RateMeter();
     this.meterOut = new RateMeter();
     this.counters = {
       streamsOpened: 0, streamsClosed: 0, resets: 0,
       controlIn: 0, controlOut: 0,
       datagramsIn: 0, datagramsOut: 0, datagramsDropped: 0,
-      flowViolations: 0, sendFailures: 0,
+      flowViolations: 0, sendFailures: 0, windowGrows: 0, windowBlocked: 0,
     };
 
     this.rttMs = null;
@@ -307,6 +355,32 @@ class Mux extends EventEmitter {
     }
     if (segmentBytes > 0) this.segmentBytes = Math.min(segmentBytes, LIMITS.SEGMENT_BYTES);
     if (maxStreams > 0) this.maxStreams = Math.min(maxStreams, LIMITS.MAX_STREAMS);
+  }
+
+  /**
+   * El sıkışmada uzlaşılan ortak yetenekler (`mine & theirs`).
+   *
+   * Bu maske kurulmadan hiçbir yeni denetim çerçevesi gönderilmez; gerekçe
+   * constants.js FEATURES.
+   */
+  setFeatures(mask) {
+    this.features = (Number(mask) || 0) >>> 0;
+  }
+
+  /**
+   * Kanalı çoklayıcıya bağlar: "elimde şu kadar veri var" sorusunun cevabını
+   * kanala verir.
+   *
+   * Kanal el sıkışma sırasında oluştuğu için yapıcıda hazır olmayabilir;
+   * bağlama bu yüzden tembel yapılır ve bir kez yapılır.
+   */
+  _bindChannel() {
+    if (this._channelBound) return this.socket.reliable || null;
+    const ch = this.socket.reliable;
+    if (!ch || typeof ch.setPendingSource !== 'function') return ch || null;
+    ch.setPendingSource(() => this.pendingBytes);
+    this._channelBound = true;
+    return ch;
   }
 
   setEgressRate(bytesPerSec) {
@@ -372,9 +446,15 @@ class Mux extends EventEmitter {
     stream.writable = false;
     stream.readable = false;
     stream.queue.length = 0;
+    this.pendingBytes -= stream.queuedBytes;
     stream.queuedBytes = 0;
     this._deactivate(stream);
     this.streams.delete(stream.id);
+    // Kanalın o akış için tuttuğu sıralı teslim tamponunu da bırak; aksi hâlde
+    // kapanan her akış `orderedBytes` tavanından kalıcı bir pay götürür ve
+    // tavan yavaşça tükenir.
+    const ch = this.socket.reliable;
+    if (ch && typeof ch._dropOrderedState === 'function') ch._dropOrderedState(stream.id);
     if (this.role === 'server') this._releaseStreamId(stream.id);
     this.counters.streamsClosed++;
 
@@ -580,6 +660,7 @@ class Mux extends EventEmitter {
 
   _pump() {
     if (this.pumping || this.closed) return;
+    if (!this._channelBound) this._bindChannel();
     this.pumping = true;
     try { this._pumpLoop(); } finally { this.pumping = false; }
   }
@@ -646,11 +727,14 @@ class Mux extends EventEmitter {
       if (allowance <= 0) {
         if (stream.sendWindow <= 0) {
           // Bu akışın penceresi kapalı: kredi gelene kadar sıradan çıkar.
+          // Karşı tarafa da söylenir — pencere darboğazını YALNIZCA bu taraf
+          // görebilir (gerekçe: frames.encodeWindowBlocked).
+          this._noteWindowBlocked(now);
           this._deactivate(stream);
           blocked = 0;
           continue;
         }
-        if (this.connSendWindow <= 0) break; // tünel geneli pencere: kimse ilerleyemez
+        if (this.connSendWindow <= 0) { this._noteWindowBlocked(now); break; }
         // deficit tükendi: bandın sonuna.
         stream.creditedThisRound = false;
         this._rotate(queue);
@@ -705,11 +789,13 @@ class Mux extends EventEmitter {
     if (first.length === n) {
       stream.queue.shift();
       stream.queuedBytes -= n;
+      this.pendingBytes -= n;
       return first;
     }
     if (first.length > n) {
       stream.queue[0] = first.subarray(n);
       stream.queuedBytes -= n;
+      this.pendingBytes -= n;
       return first.subarray(0, n);
     }
     const parts = [];
@@ -728,6 +814,7 @@ class Mux extends EventEmitter {
       }
     }
     stream.queuedBytes -= got;
+    this.pendingBytes -= got;
     return parts.length === 1 ? parts[0] : Buffer.concat(parts, got);
   }
 
@@ -921,6 +1008,18 @@ class Mux extends EventEmitter {
         stream.recvWindow -= len;
         this.connRecvWindow -= len;
         stream.bytesIn += len;
+        // PENCERE DARBOĞAZ SİNYALİ. Kalan alım penceresi bir segmentin altına
+        // indiyse gönderen birazdan BİZİM yüzümüzden duracak demektir.
+        //
+        // Bu sinyal olmadan otomatik ayar kendi kuyruğunu yiyordu: pencere
+        // hızı sınırlar → sınırlı hız, hızdan türetilen büyüme hedefini eşiğin
+        // altında bırakır → pencere büyümez → hız sınırlı kalır. Ölçümde
+        // 25 Mbit'lik bir hattın 17 Mbit'te asılı kalması buydu. Tüketim
+        // hızından TÜRETİLEN bir hedef, o hızın kendisi pencereyle sınırlıyken
+        // asla kurtarıcı olamaz; darboğazın kendisini gösteren doğrudan bir
+        // kanıt gerekir.
+        if (stream.recvWindow < this.segmentBytes) this._streamWindowStarved = true;
+        if (this.connRecvWindow < this.segmentBytes) this._connWindowStarved = true;
         if (!stream.readable) {
           // Yerel taraf kapandı ama karşı taraf hâlâ yolluyor: krediyi hemen
           // iade et, yoksa pencere kapanır ve tünel yavaşça kilitlenir.
@@ -985,6 +1084,22 @@ class Mux extends EventEmitter {
       case CTRL.CREDIT:
         this._applyCredit(msg.entries);
         return;
+      case CTRL.WINDOW:
+        this._applyPeerWindowUpdate(msg);
+        return;
+      case CTRL.WINDOW_BLOCKED:
+        // Gönderen bizim penceremiz yüzünden durmuş: büyümenin DOĞRUDAN
+        // kanıtı. Yalnızca BAYRAK kurulur; ayar kendi aralığında çalışır.
+        //
+        // Kısıtlamayı burada atlamak (ve her bildirimde büyütmek) ölçülmüş bir
+        // hataydı: 250 ms'lik bir yolda gönderen açılış boyunca sürekli
+        // bloklanır, bildirimler 200 ms'de bir gelir ve pencere birkaç saniyede
+        // tavana (16 MiB) fırlar. Alım penceresi bir BELLEK TAAHHÜDÜDÜR;
+        // ölçümden kopuk büyümesi, sığ tamponlu bir yolda devasa bir kayıp
+        // fırtınasına dönüşür.
+        this._streamWindowStarved = true;
+        this._connWindowStarved = true;
+        return;
       case CTRL.PING:
         this.sendControl(frames.encodePong({ nonce: msg.nonce, sentAt: msg.sentAt }));
         this.emit('peerAlive');
@@ -1017,6 +1132,7 @@ class Mux extends EventEmitter {
 
   _noteConsumed(stream, bytes) {
     this.connPendingCredit += bytes;
+    this.meterConsumed.add(bytes);
 
     const streamThreshold = this.localStreamWindow * LIMITS.CREDIT_THRESHOLD;
     const connThreshold = this.localConnectionWindow * LIMITS.CREDIT_THRESHOLD;
@@ -1026,6 +1142,210 @@ class Mux extends EventEmitter {
       return;
     }
     this._armCreditTimer();
+  }
+
+  // -------------------------------------------------------------------------
+  // Pencere otomatik ayarı (BDP tabanlı)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Alım penceresini ölçülen bant genişliği-gecikme çarpımına göre büyütür.
+   *
+   * SORUN. Sabit bir alım penceresi, hattın kendisi kadar sert bir tavandır:
+   *
+   *     azami_hız = pencere / RTT
+   *
+   * 256 KiB'lik pencere 60 ms'de 34 Mbit, 120 ms'de 17 Mbit, 250 ms'lik bir
+   * mobil/uydu yolunda 8 Mbit eder — hat 1 Gbit olsa bile. Üstelik zarar
+   * yalnızca hız değil: pencere kapandığında çoklayıcı kanalı besleyemez,
+   * kanalın kuyruğu boşalır ve BBR bunu "uygulamanın verisi bitti" sanar
+   * (bkz. ReliableChannel._noteSendLimit). Yani sabit pencere, hem tavanı
+   * koyar hem de tıkanıklık modelini kör eder.
+   *
+   * ÖLÇÜM. Girdi, karşı tarafın bant genişliği tahmini DEĞİL, BİZİM GERÇEKTEN
+   * TÜKETTİĞİMİZ hızdır (`meterConsumed`: yerel sokete yazılmış baytlar).
+   * Bunun iki sonucu var ve ikisi de bilinçli:
+   *   • Ölçüm karşı tarafa güvenmez. Uzak uç "hattım 10 Gbit" diyerek bizde
+   *     bellek ayırtamaz.
+   *   • Yerel hedef yavaşsa pencere büyümez. Geri basınç aynen korunur:
+   *     tüketemediğimiz veri için tampon taahhüt etmeyiz.
+   *
+   * FORMÜL.
+   *
+   *     hedef = 2 × tüketim_hızı × RTT
+   *
+   * Çarpan 2 nedir: kredi karşı tarafa bir tur sonra ulaşır. Pencere yalnızca
+   * bir BDP olsaydı, kredi yoldayken gönderen durmak zorunda kalırdı — hat
+   * her turda yarı boş kalırdı. İki BDP, "uçuştaki veri" ile "yoldaki krediyi"
+   * aynı anda karşılar.
+   *
+   * YAKINSAMA. Pencere hızı sınırlıyorsa ölçülen hız `pencere / RTT` olur ve
+   * hedef `2 × pencere` çıkar: pencere ikiye katlanır. Hız artık pencereyle
+   * sınırlı olmadığında ölçüm sabitlenir ve hedef `2 × gerçek_hız × RTT`'de
+   * durur. Yani üstel büyür, kendiliğinden durur.
+   *
+   * SINIRLAR. Pencere bir BELLEK TAAHHÜDÜDÜR. Akış başına tavan
+   * `STREAM_WINDOW_MAX`, tünel geneli tavan `CONNECTION_WINDOW_MAX` — ikincisi
+   * asıl garantidir: kaç akış olursa olsun bir tünelin tamponlayacağı alım
+   * verisi onu aşamaz. Pencere yalnızca BÜYÜR; küçültmek, karşı tarafın zaten
+   * kullanmakta olduğu bir taahhüdü geri almak olurdu ve akış denetimi
+   * ihlaline (dolayısıyla akışın düşürülmesine) yol açardı.
+   */
+  _maybeTuneWindows(now) {
+    if (!this.autoTuneWindows || this.closed) return;
+    if ((this.features & FEATURES.AUTO_WINDOW) === 0) return;
+    if (now - this._lastTuneAt < LIMITS.WINDOW_TUNE_INTERVAL_MS) return;
+    this._lastTuneAt = now;
+
+    // Sinyaller okunur okunmaz temizlenir: her ayar aralığı KENDİ kanıtına
+    // bakmalı, geçmişteki bir tükenmenin kalıcı büyüme izni olmasına izin
+    // verilmemeli.
+    const streamStarved = this._streamWindowStarved;
+    const connStarved = this._connWindowStarved;
+    this._streamWindowStarved = false;
+    this._connWindowStarved = false;
+
+    const rttMs = this._tuningRttMs();
+    if (!(rttMs > 0)) return;
+    const ratePerSec = this.meterConsumed.sample(now);
+    if (!(ratePerSec > 0) && !streamStarved && !connStarved) return;
+
+    const bdp = (ratePerSec * rttMs) / 1000;
+    let wantStream = clampWindow(
+      Math.ceil(2 * bdp), LIMITS.STREAM_WINDOW, this.maxStreamWindow,
+    );
+    // Tünel geneli pencere birden çok akışı taşır ve akış başına tavandan
+    // küçük olamaz — küçük olsaydı tek bir akış kendi penceresini asla
+    // kullanamazdı.
+    let wantConn = clampWindow(
+      Math.max(Math.ceil(4 * bdp), wantStream),
+      LIMITS.CONNECTION_WINDOW, this.maxConnectionWindow,
+    );
+
+    // Pencere GERÇEKTEN tükendiyse ölçüme değil kanıta uyulur ve pencere
+    // ikiye katlanır — ama İKİ SINIRLA birlikte:
+    //
+    //   • Ayar aralığında (200 ms) EN FAZLA BİR katlama. Bildirim başına
+    //     katlamak, 250 ms'lik bir yolda pencereyi saniyeler içinde tavana
+    //     fırlatıyordu.
+    //   • Katlama, ölçülmüş BDP'nin `STARVED_BDP_CAP` katını AŞAMAZ. Tükenme
+    //     sinyali tahminin TAKILDIĞINI söyler, hattın sonsuz olduğunu değil.
+    //     Bu tavan olmadan alım penceresi tıkanıklık penceresinden bağımsız
+    //     büyür ve sığ tamponlu bir yolda kayıp fırtınası üretir.
+    //
+    // Üstel büyüme kendini durdurur: pencere yeterince büyüdüğü anda tükenme
+    // sinyali gelmez ve hedef hız tabanlı formüle döner.
+    if (streamStarved) {
+      const ceiling = Math.max(Math.ceil(STARVED_BDP_CAP * bdp), LIMITS.STREAM_WINDOW);
+      wantStream = clampWindow(
+        Math.min(Math.max(wantStream, this.localStreamWindow * 2), ceiling),
+        LIMITS.STREAM_WINDOW, this.maxStreamWindow,
+      );
+    }
+    if (connStarved || wantConn < wantStream) {
+      const ceiling = Math.max(Math.ceil(2 * STARVED_BDP_CAP * bdp), LIMITS.CONNECTION_WINDOW);
+      wantConn = clampWindow(
+        Math.min(
+          Math.max(wantConn, wantStream, connStarved ? this.localConnectionWindow * 2 : 0),
+          Math.max(ceiling, wantStream),
+        ),
+        LIMITS.CONNECTION_WINDOW, this.maxConnectionWindow,
+      );
+    }
+
+    const growStream = wantStream >= this.localStreamWindow * LIMITS.WINDOW_GROW_FACTOR;
+    const growConn = wantConn >= this.localConnectionWindow * LIMITS.WINDOW_GROW_FACTOR;
+    if (!growStream && !growConn) return;
+
+    const nextStream = growStream ? wantStream : this.localStreamWindow;
+    const nextConn = growConn ? wantConn : this.localConnectionWindow;
+    this._growLocalWindows(nextStream, nextConn);
+  }
+
+  /**
+   * Karşı tarafın penceresi bizi durdurdu — bir kez bildir.
+   *
+   * Kısıtlama şart: pencere kapalıyken pompa saniyede yüzlerce kez bu yola
+   * girer. Ayar aralığında tek bildirim, alıcının bir sonraki ayar turunda
+   * kararını vermesi için yeterlidir; fazlası denetim düzlemini doldurur ve
+   * tam da açmaya çalıştığı tıkanmayı büyütür.
+   */
+  _noteWindowBlocked(now) {
+    if ((this.features & FEATURES.AUTO_WINDOW) === 0) return;
+    if (now - this._lastBlockedAt < LIMITS.WINDOW_TUNE_INTERVAL_MS) return;
+    this._lastBlockedAt = now;
+    this.counters.windowBlocked++;
+    this.sendControl(frames.encodeWindowBlocked());
+  }
+
+  /** Ayarın kullandığı RTT: saf ağ turu, kuyruk gecikmesi dahil değil. */
+  _tuningRttMs() {
+    const ch = this.socket.reliable;
+    if (ch && ch.rttMs > 0) return ch.rttMs;
+    if (this.rttMs > 0) return this.rttMs;
+    return 0;
+  }
+
+  /**
+   * Yerel pencereleri büyütür ve karşı tarafa bildirir.
+   *
+   * SIRA HAYATİ: önce KENDİ taahhüdümüzü büyütürüz, sonra çerçeveyi
+   * göndeririz. Tersi olsaydı, gönderen bizim henüz ayırmadığımız pencereyi
+   * kullanmaya başlar ve akış denetimi ihlali sayılıp akış düşürülürdü.
+   */
+  _growLocalWindows(nextStream, nextConn) {
+    const streamDelta = nextStream - this.localStreamWindow;
+    const connDelta = nextConn - this.localConnectionWindow;
+    if (streamDelta <= 0 && connDelta <= 0) return;
+
+    this.localStreamWindow = nextStream;
+    this.localConnectionWindow = nextConn;
+
+    if (streamDelta > 0) {
+      for (const s of this.streams.values()) {
+        if (!s.closed) s.recvWindow += streamDelta;
+      }
+    }
+    if (connDelta > 0) this.connRecvWindow += connDelta;
+
+    this.counters.windowGrows++;
+    this.sendControl(frames.encodeWindow({
+      streamWindow: this.localStreamWindow,
+      connectionWindow: this.localConnectionWindow,
+    }));
+  }
+
+  /**
+   * Karşı taraf pencere tavanını büyüttü.
+   *
+   * Deltanın mevcut `sendWindow`a EKLENMESİ şart, tavanın kendisine
+   * ATANMASI değil: akış o an penceresinin bir kısmını kullanmış olabilir ve
+   * atamak, henüz ACK'lenmemiş baytları ikinci kez harcanabilir gösterirdi.
+   */
+  _applyPeerWindowUpdate({ streamWindow, connectionWindow }) {
+    const nextStream = clampWindow(streamWindow, 0, LIMITS.STREAM_WINDOW_MAX);
+    const nextConn = clampWindow(connectionWindow, 0, LIMITS.CONNECTION_WINDOW_MAX);
+
+    // Yalnızca BÜYÜME kabul edilir. Küçültme, karşı tarafın zaten verdiği bir
+    // taahhüdü geri alması demektir; uygulasaydık uçuştaki veri bir anda
+    // "pencere ihlali" hâline gelirdi.
+    const streamDelta = nextStream - this.peerStreamWindow;
+    const connDelta = nextConn - this.peerConnectionWindow;
+
+    if (streamDelta > 0) {
+      this.peerStreamWindow = nextStream;
+      for (const s of this.streams.values()) {
+        if (!s.closed) {
+          s.sendWindow += streamDelta;
+          if (s.queuedBytes > 0 || s.finQueued) this._activate(s);
+        }
+      }
+    }
+    if (connDelta > 0) {
+      this.peerConnectionWindow = nextConn;
+      this.connSendWindow += connDelta;
+    }
+    if (streamDelta > 0 || connDelta > 0) this._pump();
   }
 
   _armCreditTimer() {
@@ -1040,6 +1360,9 @@ class Mux extends EventEmitter {
   _flushCredits() {
     if (this.creditTimer) { clearTimeout(this.creditTimer); this.creditTimer = null; }
     if (this.closed) return;
+    // Ayar burada tetiklenir: kredi boşaltımı zaten tüketimle orantılı ve
+    // kısıtlanmış bir olaydır, ayrı bir zamanlayıcıya gerek yok.
+    this._maybeTuneWindows(Date.now());
 
     const entries = [];
     for (const stream of this.streams.values()) {
@@ -1066,7 +1389,20 @@ class Mux extends EventEmitter {
     const stream = this.streams.get(info.streamId);
     this.poisoned.add(info.streamId);
     this.log.warn('akışta sıra atlandı, akış düşürülüyor', info);
-    if (stream) this._destroyStream(stream, RST_CODE.FLOW_VIOLATION, 'sıra atlaması');
+    if (!stream) return;
+
+    // KARŞI TARAFA SÖYLENMELİ. Akışı yalnızca yerelde düşürmek, ölçülmüş bir
+    // KİLİTLENMEYDİ: biz akışı yok ederiz, kredi üretmeyi bırakırız; gönderen
+    // ise penceresi kapalı hâlde, gelmeyecek bir krediyi SONSUZA KADAR bekler.
+    // Aktarım durur, hiçbir hata görünmez, hiçbir zamanlayıcı devreye girmez —
+    // tünel "sessizce donmuş" olur. Tek yönlü yıkım her zaman bir askıda
+    // kalma riskidir; sonlandırma iki tarafta da ilan edilmelidir.
+    stream.queue.length = 0;
+    this.pendingBytes -= stream.queuedBytes;
+    stream.queuedBytes = 0;
+    stream.writable = false;
+    this._sendOnStream(stream, frames.frameRst(RST_CODE.FLOW_VIOLATION), 0, true);
+    this._destroyStream(stream, RST_CODE.FLOW_VIOLATION, 'sıra atlaması');
   }
 
   // -------------------------------------------------------------------------
@@ -1092,6 +1428,12 @@ class Mux extends EventEmitter {
       channelQueuedBytes: this.socket.reliable ? this.socket.reliable.queuedBytes : 0,
       queueAllowanceBytes: this._queueAllowance(),
       outstandingBytes: this.outstandingBytes,
+      /** Üst katmanın kanala vermediği veri — "app-limited" kararının girdisi. */
+      pendingBytes: this.pendingBytes,
+      /** Gönderimi durduran son sınır (none/drained/cwnd/pacing/tracking). */
+      sendLimit: channel ? channel.sendLimit : null,
+      streamWindow: this.localStreamWindow,
+      peerStreamWindow: this.peerStreamWindow,
       connSendWindow: this.connSendWindow,
       connRecvWindow: this.connRecvWindow,
       bytesIn: this.meterIn.total,
@@ -1141,10 +1483,18 @@ class Mux extends EventEmitter {
       stream.queuedBytes = 0;
       stream.emit('close', { code: RST_CODE.TUNNEL_CLOSING, reason: 'tünel kapandı' });
     }
+    this.pendingBytes = 0;
     this.streams.clear();
     for (const band of this.bands) band.length = 0;
     this.emit('closed', err || null);
   }
+}
+
+/** Pencere değerini geçerli aralığa kırpar; geçersiz girdi tabana düşer. */
+function clampWindow(v, min, max) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return min;
+  return Math.min(Math.max(Math.floor(n), min), max);
 }
 
 /** QoS kodunu geçerli bir banda indirger; bilinmeyen değer etkileşimli olur. */
@@ -1159,5 +1509,5 @@ function normalizePriority(qos) {
 module.exports = {
   Mux, TunnelStream, SCHED_QUANTUM, REALTIME_QUANTUM, STREAM_HIGH_WATER,
   STARVATION_GUARD_MS, REALTIME_QUEUE_FACTOR, FRESH_QUEUE_FACTOR,
-  QUEUE_FLOOR_MTUS, normalizePriority,
+  QUEUE_FLOOR_MTUS, normalizePriority, clampWindow,
 };

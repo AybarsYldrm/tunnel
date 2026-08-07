@@ -43,6 +43,12 @@ const CTRL = Object.freeze({
   /** Akış denetimi kredisi. Veri akışında DEĞİL denetim akışında taşınır —
    *  aksi hâlde kredi, serbest bırakacağı verinin arkasında sıraya girerdi. */
   CREDIT: 0x30,
+  /** Alıcının pencere TAVANINI büyüttüğünü bildirir (otomatik ayar).
+   *  Yalnızca FEATURES.AUTO_WINDOW iki tarafta da açıksa gönderilir. */
+  WINDOW: 0x31,
+  /** Gönderenin, KARŞI TARAFIN penceresi yüzünden durduğunu bildirir.
+   *  Otomatik ayarın büyüme kanıtı budur (QUIC'in DATA_BLOCKED'ına karşılık). */
+  WINDOW_BLOCKED: 0x32,
 
   PING: 0x40,
   PONG: 0x41,
@@ -169,6 +175,23 @@ const ERR_CODE = Object.freeze({
 const PROTOCOL_VERSION = 1;
 
 /**
+ * HELLO/HELLO_OK'ta takas edilen yetenek bitleri.
+ *
+ * Neden gerekli: `decodeControl` tanımadığı bir denetim tipini PROTOKOL HATASI
+ * sayar ve tünel kapanır. Yani yeni bir denetim çerçevesi eklemek, eski bir
+ * eşle konuşulduğunda bağlantıyı DÜŞÜRÜR. Yetenek maskesi bunu yapısal olarak
+ * imkânsız kılar: bir çerçeve, karşı taraf da desteklediğini bildirmeden asla
+ * gönderilmez. Yürürlükteki maske `mine & theirs`.
+ */
+const FEATURES = Object.freeze({
+  /** Akış/tünel pencerelerinin BDP'ye göre otomatik büyütülmesi (CTRL.WINDOW). */
+  AUTO_WINDOW: 1 << 0,
+});
+
+/** Bu sürümün desteklediği yeteneklerin tamamı. */
+const SUPPORTED_FEATURES = FEATURES.AUTO_WINDOW;
+
+/**
  * Boyut sınırları.
  *
  * SEGMENT_BYTES neden 16 KiB? Kanala verilen her mesaj, kanalın kuyruğunda
@@ -186,10 +209,47 @@ const LIMITS = Object.freeze({
   SEGMENT_BYTES: 16 * 1024,
   /** Gerçek zamanlı bantta segment: küçük ve sık. */
   REALTIME_SEGMENT_BYTES: 4 * 1024,
-  /** Akış başına başlangıç alım penceresi. */
+  /**
+   * Akış başına BAŞLANGIÇ alım penceresi — ve otomatik ayarın TABANI.
+   *
+   * Sabit bir pencere, bant genişliği-gecikme çarpımından (BDP) küçük kaldığı
+   * anda hattın kendisi kadar sert bir tavan olur:
+   *
+   *     azami_hız = pencere / RTT
+   *
+   * 256 KiB, 60 ms'lik bir yolda 34 Mbit; 120 ms'de 17 Mbit; 250 ms'lik bir
+   * uydu/mobil bağlantıda 8 Mbit eder. Hat 100 Mbit olsa bile. Bu yüzden
+   * pencere ölçülen BDP'ye göre büyütülür (bkz. STREAM_WINDOW_MAX).
+   */
   STREAM_WINDOW: 256 * 1024,
+  /**
+   * Otomatik ayarın akış başına SERT TAVANI.
+   *
+   * Pencere bir bellek taahhüdüdür: alıcı, bu kadar baytı yerel soket
+   * yetişemese bile tamponlamayı kabul eder. Tavan olmadan otomatik ayar,
+   * yüksek gecikmeli bir yolda tampon şişmesini (bufferbloat) ve sınırsız
+   * bellek tüketimini birlikte üretirdi.
+   */
+  STREAM_WINDOW_MAX: 16 * 1024 * 1024,
   /** Tünel geneli alım penceresi — tüm akışların toplam bellek tavanı. */
   CONNECTION_WINDOW: 8 * 1024 * 1024,
+  /**
+   * Tünel geneli pencerenin sert tavanı.
+   *
+   * ASIL BELLEK GARANTİSİ BUDUR: akış başına tavan 16 MiB olsa da, tüm
+   * akışların toplamı bu değeri aşamaz. Bir tünelin en kötü durumda
+   * tamponlayacağı alım verisi bu sayıyla sınırlıdır.
+   */
+  CONNECTION_WINDOW_MAX: 32 * 1024 * 1024,
+  /** Pencere otomatik ayarının yeniden değerlendirilme aralığı (ms). */
+  WINDOW_TUNE_INTERVAL_MS: 200,
+  /**
+   * Pencere ancak hedef, yürürlükteki değerin bu katını aşarsa büyütülür.
+   *
+   * Histerezis olmadan her ölçüm gürültüsü bir CTRL.WINDOW çerçevesi ve tüm
+   * akışlara kredi dağıtımı üretirdi; pencere de sürekli tırmanırdı.
+   */
+  WINDOW_GROW_FACTOR: 1.25,
   /** Pencerenin bu oranı tüketilince kredi yollanır (her segmentte değil). */
   CREDIT_THRESHOLD: 0.5,
   /**
@@ -235,6 +295,7 @@ const TIMING = Object.freeze({
 
 module.exports = {
   PROTOCOL_VERSION,
+  FEATURES, SUPPORTED_FEATURES,
   STREAM, CTRL, DATA, DGRAM,
   PROTO, PROTO_NAME, PROTO_CODE,
   DELIVERY, DELIVERY_NAME,

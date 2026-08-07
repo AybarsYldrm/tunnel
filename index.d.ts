@@ -144,6 +144,16 @@ export interface ReliableOptions {
   bbr?: BbrOptions;
   /** Çerçeve başına yük sınırı; varsayılan mtu - 64. */
   mtu?: number;
+  /** Sıralı modda bekletilecek mesaj sayısı (varsayılan 1024). */
+  maxOrderedBuffer?: number;
+  /**
+   * Sıralı teslim tamponunun TOPLAM bayt tavanı (varsayılan 32 MiB).
+   *
+   * Sayı sınırı tek başına yetmez: mesaj başına tavan 16 MiB olduğu için
+   * yalnızca sayıya bakan bir sınır, karşı tarafın sırayı bilerek bozarak
+   * gigabaytlarca tampon açtırmasına izin verirdi.
+   */
+  maxOrderedBytes?: number;
   /** RTT örneği alınana kadarki başlangıç tahmini (ms, varsayılan 333). */
   initialRtt?: number;
   /** PTO alt/üst sınırları (ms). */
@@ -158,7 +168,8 @@ export interface ReliableOptions {
   /** İzlenen paket sayısı için sert bellek tavanı. */
   maxTrackedPackets?: number;
   maxReassembly?: number;
-  maxOrderedBuffer?: number;
+  maxReassemblyBytes?: number;
+  maxMessageBytes?: number;
 
   /** @deprecated `initialRtt` kullanın. */
   rto?: number;
@@ -395,6 +406,20 @@ export interface RecoveryStats extends ReliableStats {
   timerLagMs?: number;
   timerLagSamples?: number;
   timerLagWorstMs?: number;
+  /**
+   * Gönderimin neden durduğu.
+   *
+   * `drained` tek başına "uygulama sınırlı" ANLAMINA GELMEZ: üst katman veri
+   * tutuyorken kuyruğun boşalması, kendi kuyruk hedefimizin/penceremizin
+   * sonucudur. Ayrım BBR'ın modelini dondurmaması için yapılır.
+   */
+  sendLimit?: 'none' | 'drained' | 'cwnd' | 'pacing' | 'tracking';
+  /** Üst katmanın kanala vermediği bayt (setPendingSource kurulmuşsa). */
+  upperPendingBytes?: number | null;
+  /** Sıralı teslim tamponunda bekleyen toplam bayt. */
+  orderedBytes?: number;
+  /** Son tur tıkanıklık modelini beslemeye yetkili miydi (boru dolu muydu). */
+  roundPipeFull?: boolean;
   /** Uygulama veri üretemediği için hattı boş bıraktık mı. */
   appLimited: boolean;
   /** BBR: bant genişliği-gecikme çarpımı (bayt). */
@@ -417,6 +442,14 @@ export interface ReliableChannel extends EventEmitter {
   readonly congestionControl: 'bbr3' | 'newreno';
   getStats(): RecoveryStats;
   sendMessage(data: Buffer, opts?: SendOptions): Promise<number>;
+  /**
+   * Üst katmanın kanala VERMEDİĞİ ama elinde tuttuğu baytı okuyan işlev.
+   *
+   * Kurulmazsa kuyruğun boşalması "uygulama sınırlı" sayılır. Kuyruğu bilerek
+   * kısa tutan bir üst katman (çoklayıcı) bunu kurmalıdır; kurmazsa tıkanıklık
+   * modeli, kendi frenimizi uygulamanın susması sanar.
+   */
+  setPendingSource(fn: (() => number) | null): void;
   sendUnreliable(data: Buffer): unknown;
   ping(token?: number): unknown;
   close(err?: Error): void;

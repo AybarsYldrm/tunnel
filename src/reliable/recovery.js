@@ -36,6 +36,7 @@ const {
   initialWindow, minimumWindow, kLossReductionFactor,
 } = require('./congestion.js');
 const { Pacer } = require('./pacing.js');
+const { now: monotonicNow } = require('./clock.js');
 
 const kPacketThreshold = 3;             // RFC 9002 §6.1.1
 const kTimeThreshold = 9 / 8;           // RFC 9002 §6.1.2
@@ -130,7 +131,7 @@ class LossRecovery {
    * @param {boolean} [o.ackEliciting] ACK bekleyen bir paket mi (ACK çerçeveleri hariç her şey)
    * @param {*} [o.meta]             çağıranın kayıt tuttuğu veri (hangi parça?)
    */
-  onPacketSent({ pn, bytes, ackEliciting = true, meta = null, now = Date.now() }) {
+  onPacketSent({ pn, bytes, ackEliciting = true, meta = null, now = monotonicNow() }) {
     const entry = { pn, bytes, sentTime: now, ackEliciting, inFlight: ackEliciting, meta };
 
     // Teslim hızı örneklemesi paketin ÜZERİNE yazılır: ACK geldiğinde o anki
@@ -159,7 +160,7 @@ class LossRecovery {
   }
 
   /** Bu boyutta bir paket şu an gönderilebilir mi (pencere + hız). */
-  canSend(bytes, now = Date.now()) {
+  canSend(bytes, now = monotonicNow()) {
     if (!this.hasCongestionRoom(bytes)) return false;
     if (!this.pacer) return true;
     return this.pacer.canSend(bytes, now);
@@ -169,7 +170,7 @@ class LossRecovery {
    * Hız şekillendiricinin izin vermesine kalan süre (ms).
    * @returns {number} 0 = şimdi gönderilebilir
    */
-  pacingDelay(bytes, now = Date.now()) {
+  pacingDelay(bytes, now = monotonicNow()) {
     if (!this.pacer) return 0;
     return this.pacer.delayUntilSend(bytes, now);
   }
@@ -183,7 +184,7 @@ class LossRecovery {
    * darboğazı aşardı — gerçek zamanlı trafiği korumak için eklenen ayrıcalık,
    * herkesin gecikmesini artırarak tam tersini yapardı.
    */
-  noteUnpacedSend(bytes, now = Date.now()) {
+  noteUnpacedSend(bytes, now = monotonicNow()) {
     this.stats.unpacedBytes += bytes;
     if (this.pacer) this.pacer.onSent(bytes, now);
   }
@@ -201,7 +202,7 @@ class LossRecovery {
    * @param {number} requestedMs istenen gecikme
    * @param {number} actualMs    monotonik saatle ölçülen gerçek gecikme
    */
-  noteTimerWake(requestedMs, actualMs, now = Date.now()) {
+  noteTimerWake(requestedMs, actualMs, now = monotonicNow()) {
     if (this.pacer) this.pacer.observeTimerWake(requestedMs, actualMs, now);
   }
 
@@ -225,7 +226,7 @@ class LossRecovery {
    * @param {number} [o.ackDelay]              gönderenin bildirdiği gecikme (ms)
    * @returns {{acked: object[], lost: object[]}}
    */
-  onAckReceived({ ranges, ackDelay = 0, now = Date.now() }) {
+  onAckReceived({ ranges, ackDelay = 0, now = monotonicNow() }) {
     const acked = [];
     let largestNewlyAcked = -1;
     let largestNewlyAckedEntry = null;
@@ -387,7 +388,7 @@ class LossRecovery {
    *   `lost` boş ve `probes > 0` ise bu bir PTO'dur: kayıp İLAN EDİLMEZ,
    *   yalnızca ACK üretmek için sonda paketleri gönderilir (§6.2.4).
    */
-  onLossDetectionTimeout(now = Date.now()) {
+  onLossDetectionTimeout(now = monotonicNow()) {
     if (this.lossTime !== 0 && this.lossTime <= now) {
       const lost = this._detectAndRemoveLostPackets(now);
       if (lost.length) {
