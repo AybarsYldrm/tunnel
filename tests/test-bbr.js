@@ -21,6 +21,7 @@ const {
   createCongestionController, WindowedFilter, RateSampler, BBR_STATE,
 } = require('../src/reliable/congestion.js');
 const { Pacer } = require('../src/reliable/pacing.js');
+const { TimeWindowedMax } = require('../src/reliable/congestion.js');
 
 const r = new Runner('BBRv3 tıkanıklık denetimi');
 
@@ -208,6 +209,60 @@ function simulate({
     f.update(2, 40);
     f.update(3, 30);
     assert.ok(f.get() < 100, 'pencere kayınca tepe düşmeli');
+  });
+
+  await r.test('zaman eksenli pencereli maksimum: gerçek tepe, tahsissiz', () => {
+    const f = new TimeWindowedMax(1000, 8);
+    assert.equal(f.get(0), 0, 'boş süzgeç sıfır döner');
+
+    assert.equal(f.update(0, 10), 10);
+    assert.equal(f.update(100, 5), 10, 'küçük örnek tepeyi düşürmez');
+    assert.equal(f.update(200, 7), 10);
+    assert.equal(f.update(300, 20), 20, 'büyük örnek tepeyi devralır');
+
+    // Tepe pencereden çıkınca gerçek maksimuma düşülür — ÜÇ ÖRNEKLİ
+    // yaklaşımın veremediği şey tam olarak bu kesinlik.
+    assert.equal(f.update(1400, 3), 3, 'pencere kaydı: eski tepe unutulmalı');
+
+    // Örnek GELMEDEN de zaman geçer.
+    const g = new TimeWindowedMax(1000, 8);
+    g.update(0, 42);
+    assert.equal(g.get(500), 42);
+    assert.equal(g.get(2000), 42, 'tek örnek kalırsa korunur (kör kalmayız)');
+  });
+
+  await r.test('pencereli maksimum kapasite dolunca bozulmaz', () => {
+    // Kapasite küçükken bile YAPI bozulmamalı: kayıp yalnızca çözünürlükte.
+    const f = new TimeWindowedMax(10_000, 4);
+    for (let i = 0; i < 200; i++) f.update(i, 200 - i);   // kesin azalan
+    const max = f.get(199);
+    assert.ok(max > 0 && Number.isFinite(max), 'halka tampon taşmasında değer bozulmamalı');
+    assert.ok(f.size <= 4, 'kapasite aşılmamalı');
+  });
+
+  await r.test('getBottleneckBandwidth anlık örneği değil pencerenin tepesini verir', () => {
+    const cc = createCongestionController('bbr3', { maxDatagramSize: 1200 });
+    const base = {
+      delivered: 100_000, bytesInFlight: 0, bytesLost: 0, packetsLost: 0,
+      minRtt: 20, latestRtt: 20,
+    };
+    const sample = (now, rate, priorDelivered) => cc.onAck({
+      ...base,
+      now,
+      rs: {
+        valid: true, deliveryRate: rate, delivered: 12_000, lost: 0,
+        priorDelivered, isAppLimited: false, intervalMs: 120,
+      },
+    });
+
+    sample(1000, 100, 0);
+    const peak = cc.getBottleneckBandwidth();
+    assert.ok(peak > 0, 'ölçüm oluşmalı');
+
+    // Anlık örnek çöktü — pencere içinde tepe korunur.
+    sample(1100, 5, 100_000);
+    assert.equal(cc.getBottleneckBandwidth(), peak,
+                 'tek bir düşük örnek darboğaz tahminini düşürmemeli');
   });
 
   await r.test('pencereli minimum süzgeci', () => {
@@ -520,6 +575,71 @@ function simulate({
     assert.ok(est > 1250 * 0.6,
               `sessizlik sonrası tahmin korunmalı, ${est.toFixed(0)} bayt/ms kaldı`);
     assert.equal(out.snapshot.appLimited, true);
+  });
+
+  // ------------------------------------------------------------------------
+  // Uygulama sınırı köprüsü — "ölüm sarmalı"
+  // ------------------------------------------------------------------------
+  await r.test('uygulama sınırlı tur modeli BESLEMEZ', () => {
+    const cc = createCongestionController('bbr3', { maxDatagramSize: 1200 });
+    const ack = (isAppLimited, bytesLost) => cc.onAck({
+      delivered: 500_000, bytesInFlight: 200_000, ackedBytes: 60_000,
+      bytesLost, packetsLost: bytesLost > 0 ? 1 : 0,
+      minRtt: 20, latestRtt: 20, now: 1000,
+      rs: {
+        valid: true, deliveryRate: 100, delivered: 60_000, lost: bytesLost,
+        priorDelivered: 0, isAppLimited, intervalMs: 120,
+      },
+    });
+
+    // Uygulama sınırlıyken görülen kayıp TIKANIKLIK SİNYALİ DEĞİLDİR: boruyu
+    // doldurmuyorsak darboğaz kuyruğu taşamaz, kayıp rastgeledir.
+    ack(true, 40_000);
+    assert.equal(cc.roundPipeFull, false, 'uygulama sınırlı tur yetkili olmamalı');
+    assert.equal(cc.bwLo, Infinity, 'kısa vadeli tavan düşürülmemeli');
+    assert.equal(cc.inflightLo, Infinity);
+    assert.equal(cc.lossRoundsInStartup, 0,
+                 'uygulama sınırlı kayıp, başlangıçtan çıkışı tetiklememeli');
+  });
+
+  await r.test('başlangıçtan kayıpla çıkışta tavan ÖLÇÜLMÜŞ kapasitenin altına inmez', () => {
+    // Sarmalın tam olarak başladığı yer: tek turluk bir ölçüm kalıcı bir
+    // pencere tavanına dönüşürse cwnd çöker ve bir daha toparlanamaz.
+    const cc = createCongestionController('bbr3', { maxDatagramSize: 1200 });
+    cc.maxBw = 3000;              // bayt/ms = 24 Mbit
+    cc.minRtt = 100;              // BDP = 300_000 bayt
+    cc.inflightLatest = 8 * 1200; // kısa bir turun ölçümü
+    cc.lossRoundsInStartup = cc.cfg.fullLossCnt;
+    cc.roundStart = true;
+    cc.lossRoundStart = true;
+    cc.roundPipeFull = true;
+    cc.lossRateThisRound = 0.5;
+
+    cc._checkStartupDone({ rs: { isAppLimited: false } });
+    assert.equal(cc.startupExitReason, 'loss');
+    assert.ok(cc.inflightHi >= cc.bdp(1),
+              `tavan (${cc.inflightHi}) ölçülmüş BDP'nin (${cc.bdp(1)}) altına inmemeli`);
+  });
+
+  await r.test('inflight_hi bir CIRCIR değildir: yoklama tavanı yükseltir', () => {
+    // Uçuş cwnd ile, cwnd `inflight_hi` ile sınırlı. Tavan yalnızca
+    // "gerçekleşen uçuş" kadar yükselseydi bir daha ASLA büyümezdi ve bir kez
+    // düşük ölçülmüş tavan hattı kalıcı olarak kısardı.
+    const cc = createCongestionController('bbr3', { maxDatagramSize: 1200 });
+    cc.maxBw = 3000;    // bayt/ms = 24 Mbit
+    cc.minRtt = 100;    // BDP = 300_000 bayt
+    cc.state = BBR_STATE.PROBE_BW_UP;
+    cc.inflightHi = 100_000;   // gerçek kapasitenin çok altında
+    const before = cc.inflightHi;
+
+    cc._updateProbeBwCycle({
+      bytesInFlight: 90_000, now: 5000, ackedBytes: 24_000,
+      rs: { valid: true, isAppLimited: false },
+    });
+
+    assert.ok(cc.inflightHi > before, 'yoklama evresi tavanı yükseltmeli');
+    assert.ok(cc.inflightHi <= cc.bdp(cc.cwndGain) + cc.extraAcked,
+              'büyüme modelin kendi hedefiyle sınırlı olmalı');
   });
 
   await r.test('kalıcı tıkanıklıkta model sıfırlanır', () => {

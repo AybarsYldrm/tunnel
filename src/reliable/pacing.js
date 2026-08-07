@@ -82,6 +82,7 @@
 // (varsayılan 5 s) geçici bir takılmanın kalıcılaşmasını engeller.
 
 const { WindowedFilter } = require('./congestion.js');
+const { now: monotonicNow } = require('./clock.js');
 
 const DEFAULTS = Object.freeze({
   /** Zamanlayıcı hassasken kovanın taşıyabileceği süre. */
@@ -195,7 +196,7 @@ class Pacer {
    * @param {number} actualMs    ölçülen gerçek gecikme (monotonik)
    * @param {number} [now]       pencere ekseni (epoch ms)
    */
-  observeTimerWake(requestedMs, actualMs, now = Date.now()) {
+  observeTimerWake(requestedMs, actualMs, now = monotonicNow()) {
     if (!Number.isFinite(requestedMs) || !Number.isFinite(actualMs)) return;
 
     // Erken uyanma (negatif fark) bir bilgi taşımaz: 0 sayılır ama YİNE DE

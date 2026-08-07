@@ -21,7 +21,7 @@ const crypto = require('node:crypto');
 
 const {
   PROTO, PROTO_NAME, DELIVERY, CTRL, DGRAM, ERR_CODE, RST_CODE, TIMING, LIMITS,
-  PROTOCOL_VERSION,
+  PROTOCOL_VERSION, SUPPORTED_FEATURES,
 } = require('../protocol/constants.js');
 const frames = require('../protocol/frames.js');
 const { Mux } = require('../common/mux.js');
@@ -167,6 +167,13 @@ class Tunnel extends EventEmitter {
       agent: msg.agent, hostname: msg.hostname, name: msg.clientName, features: msg.features,
     };
 
+    // Ortak yetenekler = ikimizin de desteklediği. Kesişimi almak, yeni bir
+    // denetim çerçevesinin eski bir istemciye GÖNDERİLMEMESİNİ garanti eder;
+    // gönderilseydi istemci onu protokol hatası sayıp tüneli kapatırdı.
+    const agreed = (SUPPORTED_FEATURES & (msg.features >>> 0)) >>> 0;
+    this.features = agreed;
+    this.mux.setFeatures(agreed);
+
     const limits = this.server.limits;
     this.mux.sendControl(frames.encodeHelloOk({
       tunnelId: this.tunnelId,
@@ -175,6 +182,7 @@ class Tunnel extends EventEmitter {
       streamWindow: limits.streamWindow,
       connectionWindow: limits.connectionWindow,
       segmentBytes: limits.segmentBytes,
+      features: agreed,
     }));
 
     this.log.info('tünel açıldı', {

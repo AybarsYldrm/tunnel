@@ -116,6 +116,100 @@ class WindowedFilter {
 }
 
 // ===========================================================================
+// Zaman eksenli pencereli maksimum — tek yönlü kuyruk (monotonic deque)
+//
+// Nichols süzgeci (yukarıda) üç örnekle çalışan bir YAKLAŞIMDIR ve ekseni
+// çağırana bırakır. Bant genişliği tahmini için iki sorunu var:
+//
+//   1. EKSEN TUR/ÇEVRİM SAYACIYDI. Sayaç ilerlemediğinde süzgeç hiç kaymaz.
+//      Aktarım başlangıç evresinde takılı kaldığında (ki uygulama sınırı
+//      yanlış bildirildiğinde tam olarak bu olur) ProbeBW çevrimi hiç
+//      artmaz ve tahmin, bir kez yükseldiği yerde SONSUZA KADAR asılı kalır.
+//      Zaman ekseni böyle bir açığa sahip değildir: saat her koşulda ilerler.
+//   2. ÜÇ ÖRNEK YAKLAŞIMDIR. Pencerenin gerçek maksimumu yerine, çeyreklere
+//      bölünmüş bir tahmin verir. Ölçüm gürültülüyken bu, tepe değerin
+//      olduğundan uzun süre yaşamasına yol açar.
+//
+// Buradaki yapı pencerenin GERÇEK maksimumunu O(1) amorti maliyetle verir:
+// değerleri azalan sırada tutan bir çift uçlu kuyruk. Yeni örnek kendisinden
+// küçük olan her şeyi arkadan siler (onlar bir daha asla maksimum olamaz),
+// pencereden çıkanlar önden düşer; maksimum her zaman baştaki elemandır.
+//
+// BELLEK: iki `Float64Array` üzerinde halka tampon. Sıcak yolda TEK BİR nesne
+// bile tahsis edilmez — ACK başına çalışan bir yapıda çöp toplayıcı
+// duraksaması, ölçmeye çalıştığı gecikmenin kendisini bozar.
+// ===========================================================================
+class TimeWindowedMax {
+  /**
+   * @param {number} windowMs pencere uzunluğu
+   * @param {number} [capacity] halka tampon kapasitesi (2'nin kuvveti)
+   */
+  constructor(windowMs, capacity = 64) {
+    this.windowMs = windowMs;
+    // Kapasite 2'nin kuvveti: indeks sarması maskeyle, bölme olmadan.
+    let cap = 1;
+    while (cap < capacity) cap <<= 1;
+    this._mask = cap - 1;
+    this._t = new Float64Array(cap);
+    this._v = new Float64Array(cap);
+    this._head = 0;   // en eski (ve en büyük) örnek
+    this._size = 0;
+    this._newestT = 0;
+  }
+
+  get size() { return this._size; }
+
+  /**
+   * @param {number} t örneğin zamanı (monotonik ms)
+   * @param {number} v örnek değeri
+   * @returns {number} pencerenin yürürlükteki maksimumu
+   */
+  update(t, v) {
+    // Azalan sıra değişmezini koru: bu örnekten KÜÇÜK VEYA EŞİT olan arka
+    // elemanlar artık asla maksimum olamaz.
+    while (this._size > 0 && this._v[(this._head + this._size - 1) & this._mask] <= v) {
+      this._size--;
+    }
+    if (this._size > this._mask) {
+      // Kapasite doldu: en eskiyi (yani mevcut maksimumu) düşür. Kayıp yalnızca
+      // çözünürlüktedir — pencere biraz erken kayar, yapı bozulmaz.
+      this._head = (this._head + 1) & this._mask;
+      this._size--;
+    }
+    const tail = (this._head + this._size) & this._mask;
+    this._t[tail] = t;
+    this._v[tail] = v;
+    this._size++;
+    this._newestT = t;
+    return this._expire(t);
+  }
+
+  /** Pencereyi `t` anına göre süpürür ve maksimumu döndürür. */
+  _expire(t) {
+    while (this._size > 1 && (t - this._t[this._head]) > this.windowMs) {
+      this._head = (this._head + 1) & this._mask;
+      this._size--;
+    }
+    return this._size > 0 ? this._v[this._head] : 0;
+  }
+
+  /**
+   * Örnek EKLEMEDEN yürürlükteki maksimum.
+   *
+   * `t` verilirse pencere ona göre süpürülür. Bu ayrım önemli: örnek
+   * gelmediğinde de zaman geçer ve bayatlamış bir tepe değerin "hâlâ geçerli"
+   * sayılması, tam olarak kaçınmak istediğimiz şey.
+   */
+  get(t) {
+    if (this._size === 0) return 0;
+    if (t === undefined) return this._v[this._head];
+    return this._expire(t);
+  }
+
+  reset() { this._head = 0; this._size = 0; this._newestT = 0; }
+}
+
+// ===========================================================================
 // Teslim hızı örnekleyicisi
 // (draft-cheng-iccrg-delivery-rate-estimation)
 //
@@ -137,6 +231,9 @@ class RateSampler {
     this.appLimitedUntil = 0;    // 0 = sınır yok; aksi hâlde bu delivered'a kadar
     this.lostBytes = 0;
     this.sample = this._emptySample();
+    /** Teşhis: ACK yığılması ve elenen örnek sayaçları. */
+    this.ackCompressed = 0;
+    this.rejectedShort = 0;
   }
 
   _emptySample() {
@@ -203,6 +300,24 @@ class RateSampler {
 
   /**
    * ACK turunu kapatır ve örneği sonuçlandırır.
+   *
+   * ACK YIĞILMASI (ack compression) — paydadaki maksimumun varlık sebebi.
+   *
+   * Wi-Fi, LTE ve ACK biriktiren ara katmanlar ACK'leri yolda sıkıştırır:
+   * gönderen 40 ms'ye yaydığı paketlerin ACK'lerini 3 ms içinde topluca alır.
+   * Hızı ACK aralığından hesaplamak, o örnekte hattı ~13 KAT hızlı göstermek
+   * demektir. Doğru payda, o baytların GERÇEKTEN yayıldığı süredir:
+   *
+   *     teslim_hızı = teslim_edilen / max(gönderim_aralığı, ack_aralığı)
+   *
+   * ELEME ÖLÇÜTÜ ARALIKTIR, BAYT SAYISI DEĞİL. "En az N paket teslim edilmiş
+   * olsun" gibi bir bayt tabanı cazip görünür ama yanlıştır: yavaş bir hatta
+   * (256 kbit, 60 ms) bant genişliği-gecikme çarpımı iki paket eder, yani her
+   * örnek elenir ve BBR o hatta KALICI OLARAK KÖR kalır. Üstelik gereksizdir —
+   * tehlikeli olan yön, kısa aralıktan çıkan AŞIRI YÜKSEK tahmindir ve pencereli
+   * maksimum yalnızca yüksek uçları saklar. Az bayt taşıyan ama bir RTT'ye
+   * yayılmış bir örnek düşük hız verir; düşük hız maksimumu bozmaz.
+   *
    * @param {number} minRttMs örnek bu süreden kısaysa güvenilmez sayılır
    */
   endAck(minRttMs) {
@@ -219,10 +334,16 @@ class RateSampler {
     s.delivered = this.delivered - s.priorDelivered;
     s.lost = this.lostBytes - s.priorLost;
     s.intervalMs = Math.max(s.sendElapsed, s.ackElapsed);
+    // ACK'ler gönderim aralığından belirgin biçimde kısa sürede geldiyse yolda
+    // sıkıştırılmışlar demektir. Örnek ATILMAZ — payda zaten doğru olanı
+    // (gönderim aralığını) seçti; yalnızca teşhis için sayılır.
+    if (s.ackElapsed > 0 && s.sendElapsed > 2 * s.ackElapsed) this.ackCompressed++;
 
-    // min_rtt'den kısa aralıklar zamanlayıcı çözünürlüğünün gürültüsüdür;
-    // bunlardan hız çıkarmak tahmini tavana fırlatır.
-    if (s.intervalMs < Math.max(1, minRttMs)) { s.valid = false; return s; }
+    if (s.intervalMs < Math.max(1, minRttMs)) {
+      this.rejectedShort++;
+      s.valid = false;
+      return s;
+    }
     s.deliveryRate = s.delivered / s.intervalMs;   // bayt/ms
     return s;
   }
@@ -387,6 +508,22 @@ const BBR_DEFAULTS = Object.freeze({
   bwProbeRandMs: 1_000,
   bwProbeBaseRounds: 2,
   bwProbeRandRounds: 2,
+
+  /**
+   * Darboğaz bant genişliği süzgecinin penceresi (ms).
+   *
+   * Eksen neden ZAMAN, tur ya da çevrim değil? Çünkü tur/çevrim sayacı
+   * İLERLEMEYEBİLİR. Aktarım başlangıç evresinde takılırsa (uygulama sınırı
+   * yanlış bildirildiğinde tam olarak bu olur) ProbeBW çevrimi hiç artmaz ve
+   * çevrim eksenli bir süzgeç, bir kez yükseldiği tepede sonsuza kadar asılı
+   * kalır — yani model, artık geçerli olmayan bir kapasiteyi savunmayı sürdürür.
+   * Saat her koşulda ilerler.
+   *
+   * 10 s neden? ProbeBW çevrimi 2–3 saniyede bir yoklama yapar; pencere
+   * birkaç çevrimi kapsamalı ki tek bir kötü çevrim tahmini düşürmesin, ama
+   * hattın gerçekten daraldığı bir değişikliği de makul sürede öğrensin.
+   */
+  bwWindowMs: 10_000,
 });
 
 class Bbr3Controller {
@@ -398,14 +535,15 @@ class Bbr3Controller {
 
     // --- model
     /**
-     * Darboğaz bant genişliği tahmini (bayt/ms).
+     * Darboğaz bant genişliği tahmini (bayt/ms) — ZAMAN eksenli pencereli
+     * maksimum.
      *
-     * Süzgecin zaman ekseni TUR DEĞİL, ProbeBW ÇEVRİMİDİR (v3). Tur başına
-     * kaydırmak, ProbeRTT'nin bilerek düşük tuttuğu birkaç turun tahmini
-     * yere çakmasına ve saniyelerce toparlanamamasına yol açar — ProbeRTT'yi
-     * %2'lik bir maliyetten %40'lık bir maliyete çevirirdi.
+     * Pencerenin birkaç ProbeBW çevrimini kapsaması şart: ProbeRTT ve iniş
+     * evresi bilerek düşük hız üretir, bunlar tahmini yere çakmamalı. Ama
+     * eksen çevrim sayacı OLMAMALI — sayaç ilerlemediğinde süzgeç hiç
+     * kaymaz ve bayat bir tepe kalıcılaşır (gerekçe: BBR_DEFAULTS.bwWindowMs).
      */
-    this.maxBwFilter = new WindowedFilter(2, 1);
+    this.maxBwFilter = new TimeWindowedMax(this.cfg.bwWindowMs, 64);
     this.cycleCount = 0;
     this.maxBw = 0;
     this.bwLatest = 0;
@@ -447,6 +585,11 @@ class Bbr3Controller {
     this.lossRoundDelivered = 0;
     this.lossInRound = false;
     this.lossEventsInRound = 0;
+    /**
+     * Son değerlendirilen tur boruyu DOLDURDU mu — yani ölçümleri modeli
+     * beslemeye yetkili mi. Uygulama/pencere sınırlı turlar yetkili değildir.
+     */
+    this.roundPipeFull = false;
     /** Tur içi ham sayaçlar — kayıp oranı BUNLARDAN çıkarılır. */
     this.roundAckedBytes = 0;
     this.roundLostBytes = 0;
@@ -480,6 +623,23 @@ class Bbr3Controller {
 
   /** Modelin bant genişliği (bayt/ms) — kısa ve uzun vadeli sınırlarla budanmış. */
   get bw() { return Math.min(this.maxBw, this.bwLo, this.bwHi); }
+
+  /**
+   * Ölçülen DARBOĞAZ bant genişliği (bayt/s).
+   *
+   * Hız şekillendirme ve pencere hesaplarının referansı budur — anlık teslim
+   * hızı örneği DEĞİL. Aradaki fark, bu modülün var oluş sebebi: tek bir
+   * örnek ACK yığılmasından, zamanlayıcı sapmasından ve kısa aralık
+   * gürültüsünden etkilenir; pencereli maksimum bunların hepsini eler ve
+   * "bu yol son N saniyede EN İYİ ne taşıdı" sorusunu yanıtlar.
+   *
+   * @param {number} [now] verilirse bayatlamış tepe değerler süpürülür
+   */
+  getBottleneckBandwidth(now) {
+    const perMs = now === undefined ? this.maxBw : this.maxBwFilter.get(now);
+    const capped = Math.min(perMs, this.bwLo, this.bwHi);
+    return capped > 0 && Number.isFinite(capped) ? capped * 1000 : 0;
+  }
 
   /** Bant genişliği-gecikme çarpımı: hattın "boruda" tutabileceği bayt. */
   bdp(gain = 1) {
@@ -526,7 +686,7 @@ class Bbr3Controller {
 
     this._updateRound(delivered, rs);
     this._updateMinRtt(ctx);
-    this._updateMaxBw(rs);
+    this._updateMaxBw(rs, now);
     this._updateAckAggregation(ctx);
     this._updateCongestionSignals(ctx);
 
@@ -585,16 +745,21 @@ class Bbr3Controller {
   }
 
   // ---- bant genişliği -----------------------------------------------------
-  _updateMaxBw(rs) {
-    if (!rs.valid || rs.deliveryRate <= 0) return;
+  _updateMaxBw(rs, now) {
+    // Örnek gelmese de pencere ilerler: bayatlamış bir tepe "hâlâ geçerli"
+    // sayılmamalı.
+    if (!rs.valid || rs.deliveryRate <= 0) { this.maxBw = this.maxBwFilter.get(now); return; }
     this.bwLatest = Math.max(this.bwLatest, rs.deliveryRate);
 
     // UYGULAMA SINIRLI örnek tahmini YÜKSELTMEZ ama düşürmesine de izin
     // verilmez: veri üretemediğimiz için yavaş görünen bir hat, yavaş bir hat
     // değildir. BBR'ın en sık yanlış uygulanan kuralı budur.
-    if (rs.isAppLimited && rs.deliveryRate < this.maxBw) return;
+    if (rs.isAppLimited && rs.deliveryRate < this.maxBw) {
+      this.maxBw = this.maxBwFilter.get(now);
+      return;
+    }
 
-    this.maxBw = this.maxBwFilter.update(this.cycleCount, rs.deliveryRate);
+    this.maxBw = this.maxBwFilter.update(now, rs.deliveryRate);
   }
 
   // ---- ACK yığılması (extra_acked) ---------------------------------------
@@ -648,15 +813,33 @@ class Bbr3Controller {
     const total = this.roundAckedBytes + this.roundLostBytes;
     const enough = total >= this.cfg.minLossSamplePackets * this.maxDatagramSize;
     this.lossRateThisRound = (enough && total > 0) ? this.roundLostBytes / total : 0;
+
+    /**
+     * BORU DOLU MUYDU? Bu turun modeli beslemeye HAKKI olup olmadığı sorusu.
+     *
+     * Uygulama (ya da akış denetimi penceresi) yüzünden boruyu doldurmadığımız
+     * bir turda görülen kayıp, TIKANIKLIK SİNYALİ DEĞİLDİR: darboğazdaki kuyruk
+     * taşmadıysa kayıp rastgele bit hatasından gelir. Buna tavan düşürerek
+     * tepki vermek, BBR'ı tam olarak kaçınmak için tasarlandığı hatanın
+     * (NewReno'nun "kayıp = tıkanıklık" varsayımının) içine sokar.
+     *
+     * Aynı tur `inflightLatest`i de beslememeli: o değer "boruya ne sığdı"
+     * ölçüsüdür ve az veri verdiğimiz bir turdan okunursa hattın kapasitesini
+     * olduğundan küçük gösterir. Bu değer daha sonra `inflight_hi` tavanına
+     * dönüştüğü için, ölçüm hatası KALICI bir pencere daralmasına çevrilir —
+     * ölüm sarmalının başladığı yer tam olarak burasıdır.
+     */
+    this.roundPipeFull = !rs.isAppLimited;
+
     // Turun teslim ettiği bayt, o turda boruya SIĞAN miktarın ölçüsüdür.
-    if (this.roundAckedBytes > 0) {
+    if (this.roundPipeFull && this.roundAckedBytes > 0) {
       this.inflightLatest = Math.max(this.roundAckedBytes, this.minPipeCwnd);
     }
 
     // Kayıp oranı eşiği aştıysa KISA VADELİ üst sınırlar (bw_lo/inflight_lo)
     // düşer. Uzun vadeli tavana (hi) burada dokunulmaz — o yalnızca yoklama
     // evresinde, bilerek yükseltilirken sınanır.
-    if (this.lossRateThisRound > this.cfg.lossThresh) {
+    if (this.roundPipeFull && this.lossRateThisRound > this.cfg.lossThresh) {
       this.congestionEvents++;
       // Alt sınır KENDİ önceki değerinden çarpımsal olarak iner ama GERÇEKTEN
       // BAŞARILMIŞ değerin altına asla düşmez. `latest * beta` yazmak — yani
@@ -706,7 +889,14 @@ class Bbr3Controller {
     // Kayıplı turları say: sığ tamponlu bir hatta bant genişliği daha
     // düzleşmeden kuyruk taşar. O noktada büyümeye devam etmek, veri değil
     // yalnızca kayıp üretir.
-    if (this.lossRoundStart && this.lossRateThisRound > this.cfg.lossThresh) {
+    //
+    // AMA yalnızca boruyu DOLDURDUĞUMUZ turlar sayılır. Uygulama sınırlıyken
+    // kuyruk taşamaz; o turdaki kayıp rastgeledir ve "hattın tavanına geldik"
+    // anlamına gelmez. Sayılsaydı, rastgele kayıplı bir hatta başlangıç
+    // evresinden ERKEN çıkılır ve `inflight_hi` tavanı, hiç ölçülmemiş bir
+    // kapasiteden türetilirdi.
+    if (this.lossRoundStart && this.roundPipeFull
+        && this.lossRateThisRound > this.cfg.lossThresh) {
       this.lossRoundsInStartup++;
     }
     if (!this.roundStart) return;
@@ -726,7 +916,15 @@ class Bbr3Controller {
     } else if (this.lossRoundsInStartup >= this.cfg.fullLossCnt) {
       this.filledPipe = true;
       this.startupExitReason = 'loss';
-      this.inflightHi = Math.max(this.inflightLatest, this.minPipeCwnd);
+      // Tavan, MODELİN ÖLÇTÜĞÜ kapasitenin altına indirilemez.
+      //
+      // `inflightLatest` tek bir turun ölçümüdür ve o tur kısa olabilir. BDP
+      // ise pencereli maksimum bant genişliği ile min_rtt'nin çarpımıdır: yol
+      // bunu TAŞIDI, ölçtük. Tavanı ölçülmüş kapasitenin altına koymak, cwnd'yi
+      // oraya kilitler; kilitlenen cwnd daha az veri gönderir, daha az veri
+      // daha düşük teslim hızı örneği üretir, düşük örnek tavanı bir kat daha
+      // indirir. Sarmal budur ve tek turluk bir ölçümle başlar.
+      this.inflightHi = Math.max(this.inflightLatest, this.bdp(1), this.minPipeCwnd);
     }
 
     if (!this.filledPipe) return;
@@ -822,6 +1020,31 @@ class Bbr3Controller {
         return;
 
       case BBR_STATE.PROBE_BW_UP: {
+        // ÖNCE TAVANI YÜKSELT — yoksa yoklamanın sınayacağı bir şey kalmaz.
+        //
+        // `inflight_hi` bir CIRCIR olma riski taşır: uçuştaki veri cwnd ile,
+        // cwnd de `targetInflight()` üzerinden `inflight_hi` ile sınırlıdır.
+        // Tavan yalnızca "gerçekleşen uçuş" kadar yükseltilirse, gerçekleşen
+        // uçuş da tavanla sınırlı olduğu için tavan BİR DAHA HİÇ BÜYÜMEZ. Bir
+        // kez düşük ölçülmüş bir tavan kalıcılaşır ve hattın geri kalanı
+        // sonsuza kadar kullanılmaz — 100 Mbit'lik bir hatta 67 Mbit'te
+        // takılmanın sebebi budur.
+        //
+        // Linux BBR bunu ACK başına tavanı artırarak çözer. Buradaki sınır
+        // MODELİN KENDİ HEDEFİDİR: tavan, ölçülmüş bant genişliği ve min_rtt'den
+        // türetilen pencere hedefini aşamaz. Böylece büyüme hem sınırlı hem de
+        // ölçüme dayalı kalır; fazla ileri giderse zaten aşağıdaki kayıp
+        // denetimi yoklamayı bitirir.
+        if (Number.isFinite(this.inflightHi)) {
+          const probeTarget = this.bdp(this.cwndGain) + this.extraAcked;
+          if (this.inflightHi < probeTarget) {
+            this.inflightHi = Math.min(
+              probeTarget,
+              this.inflightHi + Math.max(this.maxDatagramSize, ctx.ackedBytes || 0),
+            );
+          }
+        }
+
         // Yoklama, ya kayıp/aşırı uçuş görülünce ya da bir tur dolunca biter.
         if (this._isInflightTooHigh()) {
           // Tavan, BAŞARILMIŞ uçuş miktarının altına indirilmez. Yoklama
@@ -862,7 +1085,10 @@ class Bbr3Controller {
    * hatlarda yoklamayı hiç tamamlanamaz hâle getirirdi.
    */
   _isInflightTooHigh() {
-    return this.lossRoundStart && this.lossRateThisRound > this.cfg.lossThresh;
+    // `roundPipeFull` şart: yoklama sırasında boruyu doldurmadıysak, görülen
+    // kayıp yoklamanın sonucu değildir ve tavanı indirmek için gerekçe olamaz.
+    return this.lossRoundStart && this.roundPipeFull
+      && this.lossRateThisRound > this.cfg.lossThresh;
   }
 
   // ---- ProbeRTT -----------------------------------------------------------
@@ -977,7 +1203,7 @@ class Bbr3Controller {
 
   onPersistentCongestion() {
     // Ağ gerçekten koptu: model artık geçmişin fotoğrafı. Sıfırdan öğren.
-    this.maxBwFilter = new WindowedFilter(2, 1);
+    this.maxBwFilter.reset();
     this.maxBw = 0;
     this.bwLatest = 0;
     this.bwLo = Infinity;
@@ -1014,6 +1240,9 @@ class Bbr3Controller {
       filledPipe: this.filledPipe,
       startupExit: this.startupExitReason,
       rounds: this.roundCount,
+      /** Son tur modeli beslemeye yetkili miydi (boru doluydu mu). */
+      roundPipeFull: this.roundPipeFull,
+      bwSamples: this.maxBwFilter.size,
       probeRttCount: this.probeRttCount,
       congestionEvents: this.congestionEvents,
     };
@@ -1051,6 +1280,7 @@ module.exports = {
   Bbr3Controller,
   RateSampler,
   WindowedFilter,
+  TimeWindowedMax,
   BBR_STATE,
   BBR_DEFAULTS,
   initialWindow,

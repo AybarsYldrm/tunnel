@@ -252,6 +252,52 @@ Hayır — ve bunun iki ayrı mekanizması var, çünkü sınıf ayrımı bu dur
   boyu bir keredir (ilk bayt gidince biter) ve yeniler kendi aralarında
   FIFO'dur.
 
+### Akış penceresi BDP'ye göre kendini ayarlar
+
+Sabit bir alım penceresi, hattın kendisi kadar sert bir tavandır:
+
+```
+azami_hız = pencere / RTT
+```
+
+256 KiB'lik pencere 60 ms'lik bir yolda 34 Mbit, 120 ms'de 17 Mbit, 250 ms'lik
+bir mobil/uydu bağlantısında 8 Mbit eder — hat 1 Gbit olsa bile. Zarar yalnızca
+hız da değil: pencere kapandığında çoklayıcı kanalı besleyemez, kanalın kuyruğu
+boşalır ve tıkanıklık denetimi bunu "uygulamanın verisi bitti" sanar.
+
+Pencere bu yüzden ölçülen bant genişliği-gecikme çarpımına göre büyütülür:
+
+```
+hedef = 2 × tüketim_hızı × RTT          taban 256 KiB · tavan 16 MiB
+```
+
+* **Girdi karşı tarafın iddiası değil, BİZİM tükettiğimiz hızdır** (yerel sokete
+  gerçekten yazılmış baytlar). Uzak uç "hattım 10 Gbit" diyerek bizde bellek
+  ayırtamaz; yerel hedef yavaşsa pencere büyümez, geri basınç aynen korunur.
+* **Çarpan 2**, kredinin karşı tarafa bir tur sonra ulaşmasındandır. Tek BDP'lik
+  bir pencere, kredi yoldayken göndereni durdurur ve hat her turda yarı boş kalır.
+* **Yakınsama üsteldir ve kendini durdurur**: pencere hızı sınırlıyorsa hedef
+  `2 × pencere` çıkar (ikiye katlanır); sınırlamıyorsa ölçüm sabitlenir.
+* **Pencere yalnızca BÜYÜR.** Küçültmek, karşı tarafın zaten kullanmakta olduğu
+  bir taahhüdü geri almaktır: uçuştaki veri bir anda "pencere ihlali" olurdu.
+
+**Darboğazın kanıtı gönderenden gelir.** Alıcı kendi başına pencere darboğazını
+göremez — `recvWindow` kredi üretilir üretilmez dolar, gönderenin `sendWindow`u
+ise o kredi telden gelene kadar sıfırda bekler. Bu yüzden gönderen, penceresi
+kapandığında `WINDOW_BLOCKED` bildirir (QUIC'in `DATA_BLOCKED`'ına karşılık) ve
+bildirim ayar aralığında bir kez gönderilir. Kanıtsız büyüme tek başına
+yetmiyordu: pencere hızı sınırlar, sınırlı hız da hızdan türetilen büyüme
+hedefini eşiğin altında bırakır ve pencere bir daha hiç büyümez.
+
+Büyüme iki sınırla bağlıdır — ayar aralığında en fazla bir katlama, ve ölçülen
+BDP'nin dört katı. Bu tavanlar olmadan 250 ms'lik bir yolda pencere saniyeler
+içinde tavana fırlıyor ve sığ tamponlu bir hatta kayıp fırtınası üretiyordu.
+
+Yeni denetim çerçeveleri (`WINDOW`, `WINDOW_BLOCKED`) **yetenek uzlaşısına**
+bağlıdır: HELLO/HELLO_OK'ta takas edilen maskede iki taraf da desteklediğini
+bildirmeden gönderilmez. Bildirilmeden gönderilseydi eski bir eş, tanımadığı
+denetim tipini protokol hatası sayıp tüneli kapatırdı.
+
 ### Kuyruk derinliği zamanla ölçülür
 
 Çoklayıcının kanala doldurduğu veri **süreyle** sınırlıdır (`limits.targetQueueMs`,

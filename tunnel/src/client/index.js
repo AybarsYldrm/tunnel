@@ -19,7 +19,7 @@ const { EventEmitter } = require('node:events');
 const dtls = require('../../../index.js');
 const {
   PROTO, PROTO_NAME, DELIVERY, CTRL, DGRAM, RST_CODE, TIMING, LIMITS,
-  PROTOCOL_VERSION,
+  PROTOCOL_VERSION, SUPPORTED_FEATURES,
 } = require('../protocol/constants.js');
 const frames = require('../protocol/frames.js');
 const { Mux } = require('../common/mux.js');
@@ -174,6 +174,7 @@ class TunnelClient extends EventEmitter {
       agent: AGENT,
       hostname: os.hostname(),
       clientName: o.name,
+      features: SUPPORTED_FEATURES,
     }));
   }
 
@@ -208,6 +209,9 @@ class TunnelClient extends EventEmitter {
       return;
     }
     this.tunnelId = msg.tunnelId;
+    // Sunucu, kesişimi HELLO_OK'ta geri bildirir: iki taraf da aynı maskeyi
+    // görür ve tek taraflı bir varsayım kalmaz.
+    this.mux.setFeatures((SUPPORTED_FEATURES & (msg.features >>> 0)) >>> 0);
     this.mux.applyPeerWindows(msg);
     this.state = 'ready';
     this._reconnectAttempt = 0;
