@@ -289,6 +289,142 @@ function simulate({
     assert.ok(p.canSend(1000, now), 'zaman geçince yeniden gönderilebilmeli');
   });
 
+  // ------------------------------------------------------------------------
+  // Zamanlayıcı çözünürlüğü — "1 ms'lik kova" varsayımının bedeli
+  // ------------------------------------------------------------------------
+
+  /**
+   * Şekillendiriciyi, zamanlayıcısı `tickMs` çözünürlüğünde olan bir makinede
+   * çalıştırır ve GERÇEKLEŞEN hızı döndürür (bayt/s).
+   *
+   * Benzetim tam olarak gerçek döngüyü taklit eder: kova izin verdiği sürece
+   * gönder → kalan için gecikme iste → işletim sistemi o gecikmeyi kendi
+   * tikine yuvarlasın → uyan.
+   */
+  function pacedThroughput({ rateBps, tickMs, durationMs = 2000, mtu = 1200, observe = true }) {
+    const p = new Pacer({ maxDatagramSize: mtu });
+    p.setRate(rateBps);
+    let now = 0;
+    let sent = 0;
+    while (now < durationMs) {
+      while (p.canSend(mtu, now)) { p.onSent(mtu, now); sent += mtu; }
+      const wait = p.delayUntilSend(mtu, now);
+      const actual = Math.max(wait, tickMs);   // işletim sisteminin saat tiki
+      if (observe) p.observeTimerWake(wait, actual, now);
+      now += actual;
+    }
+    return { rate: (sent / now) * 1000, pacer: p };
+  }
+
+  await r.test('kaba zamanlayıcıda kova bir uyanma aralığını taşır', () => {
+    // 25 Mbit yükleme, Windows'un varsayılan 15.6 ms'lik saat tiki.
+    const rateBps = 3_125_000;
+
+    // Ölçüm KAPALI: kova 1 ms'de kalır, hat 15.6 ms'de bir yalnızca 1 ms'lik
+    // veri geçirir. Bildirilen üretim arızası birebir budur.
+    const blind = pacedThroughput({ rateBps, tickMs: 15.6, observe: false });
+    assert.ok(blind.rate < rateBps * 0.2,
+              `sabit 1 ms'lik kova hattı kilitlemeli, ${(blind.rate / rateBps * 100).toFixed(0)}% çıktı`);
+
+    // Ölçüm AÇIK: kova gerçek uyanma aralığına göre boyutlanır.
+    const measured = pacedThroughput({ rateBps, tickMs: 15.6, observe: true });
+    assert.ok(measured.rate > rateBps * 0.9,
+              `hattın tamamı kullanılmalı, ${(measured.rate / rateBps * 100).toFixed(0)}% çıktı`);
+    assert.ok(measured.pacer.timerLagMs > 10,
+              'zamanlayıcının kaba olduğu ölçülmeli');
+  });
+
+  await r.test('hassas zamanlayıcıda patlama payı büyümez', () => {
+    // Linux tipik: ~1 ms. Telafi burada da devrededir ama etkisi küçüktür;
+    // ölçülmesi gereken şey PATLAMANIN ŞİŞMEMESİ.
+    const { rate, pacer } = pacedThroughput({ rateBps: 3_125_000, tickMs: 1.2 });
+    assert.ok(rate > 3_125_000 * 0.9, 'hassas zamanlayıcıda da hat dolmalı');
+    assert.ok(pacer.burstWindowMs <= 3,
+              `patlama payı hassas makinede küçük kalmalı, ${pacer.burstWindowMs} ms bulundu`);
+  });
+
+  await r.test('ölçüm yokken davranış eskisiyle BİREBİR aynı', () => {
+    // Geriye dönük güvence: gecikme örneği oluşmadan hiçbir şey değişmemeli.
+    const p = new Pacer({ maxDatagramSize: 1200 });
+    p.setRate(3_125_000);
+    assert.equal(p.timerLagMs, 0);
+    assert.equal(p.burstWindowMs, 1);
+    // 1 ms'lik veri = 3125 bayt; paket tavanı (16×1200) bağlamıyor.
+    assert.equal(p._burstBytes(), 3125);
+
+    // Erken uyanma da bir bilgi taşımaz.
+    p.observeTimerWake(5, 4);
+    assert.equal(p.timerLagMs, 0);
+    assert.equal(p._burstBytes(), 3125);
+  });
+
+  await r.test('tek seferlik takılma dev bir patlamaya dönüşmez', () => {
+    // Olay döngüsünü 400 ms kilitleyen senkron bir iş (GC, sanal makine
+    // duraklaması). Telafi edilirse 400 ms'lik veri tek seferde salınır ve
+    // darboğazda tam olarak kaçındığımız kuyruk oluşur.
+    const p = new Pacer({ maxDatagramSize: 1200 });
+    p.setRate(3_125_000);
+    p.observeTimerWake(1, 401);
+
+    assert.ok(p.burstWindowMs <= 25, 'gecikme telafisi tavanla sınırlı olmalı');
+    assert.ok(p._burstBytes() <= Math.ceil((3_125_000 * 25) / 1000),
+              'patlama, tavan süresinin karşılığını aşmamalı');
+    assert.ok(p.worstLagMs > 0, 'takılma teşhis için kaydedilmeli');
+  });
+
+  await r.test('gözlenen gecikme pencere dolunca geri iner', () => {
+    const p = new Pacer({ maxDatagramSize: 1200, lagWindowMs: 1000 });
+    p.setRate(3_125_000);
+    p.observeTimerWake(1, 17, 0);            // kaba tik
+    assert.ok(p.timerLagMs > 10);
+
+    // Zamanlayıcı düzeldi: pencere kaydıkça tahmin de düşmeli, yoksa geçici
+    // bir takılma kalıcı bir patlama payına dönüşür.
+    for (let t = 100; t <= 4000; t += 100) p.observeTimerWake(1, 1.1, t);
+    assert.ok(p.timerLagMs < 1,
+              `pencere dolunca gecikme unutulmalı, ${p.timerLagMs} ms kaldı`);
+  });
+
+  await r.test('bayat damga aynı aralık için İKİ KEZ jeton vermez', () => {
+    // Gönderim yolunda iki damga dolaşır: pompa turun BAŞINDAKİ damgayı
+    // kullanır, gönderim muhasebesi taze bir damga alır. Tur bir milisaniyeyi
+    // aşınca ikisi gidip gelir. Kova bu gidiş gelişi "saat geriye gitti" sanıp
+    // damgayı geri sararsa, her turda aynı aralığın jetonunu yeniden üretir ve
+    // şekillendirme SESSİZCE devre dışı kalır — hedef hızın katlarına çıkılır.
+    const p = new Pacer({ maxDatagramSize: 1200 });
+    p.setRate(1_000_000);                 // 1000 bayt/ms, patlama 2400 bayt
+
+    let sent = 0;
+    for (let i = 0; i < 50; i++) {
+      if (p.delayUntilSend(1200, 100) !== 0) break;
+      p.onSent(1200, 101);                // muhasebe bir milisaniye ileride
+      sent += 1200;
+    }
+    // 1 ms'de hak edilen: patlama payı kadar. Bir tur için üst sınır budur.
+    assert.ok(sent <= 3600,
+              `bir milisaniyede en fazla patlama payı kadar çıkmalı, ${sent} bayt çıktı`);
+  });
+
+  await r.test('gerçek saat sıçraması kovayı kilitlemez', () => {
+    const p = new Pacer({ maxDatagramSize: 1200 });
+    p.setRate(1_000_000);
+    p.canSend(1200, 100_000);             // damga ileri kuruldu
+
+    // NTP düzeltmesi: saat 10 saniye geriye gitti. Damga yeniden kurulmazsa
+    // kova, gerçek zaman o noktayı geçene kadar — yani 10 saniye — hiç dolmaz.
+    p.canSend(1200, 90_000);
+    assert.ok(p.canSend(1200, 90_010),
+              'saat sıçramasından sonra şekillendirici toparlamalı');
+  });
+
+  await r.test('mutlak bayt tavanı çok hızlı hatta patlamayı bağlar', () => {
+    const p = new Pacer({ maxDatagramSize: 1200, maxBurstBytes: 64 * 1024 });
+    p.setRate(1_000_000_000);   // 8 Gbit
+    p.observeTimerWake(1, 17);
+    assert.equal(p._burstBytes(), 64 * 1024,
+                 'işletim sistemi gönderim tamponunu taşıracak patlama üretilmemeli');
+  });
+
   // ========================================================================
   // Hat üzerinde davranış
   // ========================================================================

@@ -189,6 +189,23 @@ class LossRecovery {
   }
 
   /**
+   * Hız şekillendirme zamanlayıcısı uyandı: İSTENEN ve GERÇEKLEŞEN gecikme.
+   *
+   * Şekillendiricinin jeton kovası, iki uyanma arasında biriken hakkın
+   * tavanıdır. Tavanı sabit (≈1 ms) varsaymak, `setTimeout(1)`'in gerçekten
+   * 1 ms sürdüğünü varsaymaktır; Windows'ta bu süre ~15.6 ms'dir ve aradaki
+   * fark doğrudan verim kaybına dönüşür (gerekçe ve aritmetik: pacing.js).
+   * Burada ölçümü şekillendiriciye geri veriyoruz ki kova o makinenin gerçek
+   * uyanma aralığına göre boyutlansın.
+   *
+   * @param {number} requestedMs istenen gecikme
+   * @param {number} actualMs    monotonik saatle ölçülen gerçek gecikme
+   */
+  noteTimerWake(requestedMs, actualMs, now = Date.now()) {
+    if (this.pacer) this.pacer.observeTimerWake(requestedMs, actualMs, now);
+  }
+
+  /**
    * Gönderecek veri kalmadı: bundan sonraki teslim hızı örnekleri AĞIN değil
    * UYGULAMANIN sınırını ölçer. İşaretlenmezse BBR, boş kalan hattı yavaş bir
    * hat sanır ve hızı kalıcı olarak düşürür.

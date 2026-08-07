@@ -59,6 +59,12 @@ gönderilen ilk veri baytları ondan **önce** varabilirdi — denetim akışı 
 akışı birbirinden bağımsız sıralanır. Alıcı henüz var olmayan bir akışa ait
 çerçeveyi atardı ve HTTP'nin istek satırı ya da TLS'in ClientHello'su kaybolurdu.
 
+Bunun bir bedeli var ve karşılanması gerekiyor: veri düzleminde giden `OPEN`,
+aynı bandın hacimli verisinin arkasına düşebilir. Bant yükseltmek yanlış cevap
+olurdu (açılış çerçevesi kredi kadar kritik değildir ve denetim düzlemini
+kirletirdi); doğru cevap **kendi bandının başına geçmek** — bkz. "Yeni bağlantı,
+aynı sınıftaki aktarımı bekler mi".
+
 `OPEN`'ı veri akışının **ilk mesajı** yapmak bunu yapısal olarak imkânsız kılıyor
 ve üstüne bir tur kazandırıyor: veri, açılışın onaylanmasını beklemeden akıyor.
 
@@ -227,6 +233,25 @@ adil sıralanmış segmentler alttaki tek FIFO'ya girip geliş sırasına göre
 çıkardı. Denetim çerçeveleri (kredi, kalp atışı) en üst bandı kullanır —
 kredi, serbest bırakacağı verinin arkasında beklerse akış denetimi kilitlenir.
 
+### Yeni bağlantı, aynı sınıftaki aktarımı bekler mi
+
+Hayır — ve bunun iki ayrı mekanizması var, çünkü sınıf ayrımı bu durumu
+**çözmez**: süren bir indirme ile yeni açılan bir sekme aynı sınıftadır
+(etkileşimli).
+
+* **Açılış çerçevesi fast-track'i.** `OPEN` ve `OPEN_ACK`, kanalda kendi
+  bandının **başına** girer — bandı atlamaz, yalnızca aynı sınıftaki hacimli
+  verinin arkasında beklemez. Bu bir konfor değil doğruluk meselesi:
+  `OPEN_ACK` gecikirse karşı taraf `OPEN_TIMEOUT_MS` dolduğu için akışı
+  **düşürür**; yani yerel bağlantı kurulmuş olmasına rağmen ziyaretçi
+  kapanmış bir soket görür. Ayrıcalık dört parçadan büyük mesajlarda yok
+  sayılır, dolayısıyla veri taşımak için kullanılamaz.
+* **Yeni akış, DRR sırasının başına girer.** Sıranın sonuna eklenen bir akış,
+  önündeki her akışın 32 KiB'lik kuantumunu bekler. Yeni bir bağlantının
+  ihtiyacı bant genişliği değil, **ilk turu kaçırmamaktır**. Ayrıcalık ömür
+  boyu bir keredir (ilk bayt gidince biter) ve yeniler kendi aralarında
+  FIFO'dur.
+
 ### Kuyruk derinliği zamanla ölçülür
 
 Çoklayıcının kanala doldurduğu veri **süreyle** sınırlıdır (`limits.targetQueueMs`,
@@ -237,7 +262,23 @@ olursa olsun baş-tıkanması sabit bir üst sınırda kalır.
 
 Gerçek zamanlı bant bu sınırın dört katını kullanır: kanalın kuyruğu da
 öncelikli olduğu için oraya giren paket zaten en öne geçer; onu üst katmanda
-bekletmek kazanılan şeyi geri vermek olurdu.
+bekletmek kazanılan şeyi geri vermek olurdu. Henüz tek bayt göndermemiş bir
+akış iki katını kullanır — bir bağlantının ilk segmenti, süren bir aktarımın
+doldurduğu kuyruğun arkasında beklememeli. Her iki ayrıcalık da
+`maxOutstandingBytes` tavanının **altında** kalır: öncelik, alıcı belleğini
+şişirme hakkı değildir.
+
+**Sürenin bir taban baytı vardır.** Bütçe yalnızca zamandan türetilseydi, hız
+düştükçe bütçe de düşer ve bir noktada **besleme biriminin altına** inerdi:
+1 Mbit'te 20 ms ≈ 2.5 KB'dir, oysa bir akışa tek seferde verilen segment
+16 KB'dir. Bütçe segmentten küçük olduğu anda hiçbir segment kuyruğa giremez,
+kuyruk boş kaldığı için hiçbir şey ACK'lenmez, ACK gelmediği için bütçe hiç
+serbest kalmaz — bu bir yavaşlama değil **kilitlenmedir** ve tam da hattın en
+dar olduğu anda başlar. Taban bu yüzden bayt cinsindendir: bir segment + bir
+MTU. Taban devreye girdiğinde kuyruk gecikmesi `targetQueueMs`'i aşar; bu
+bilinçli bir takastır (ilerleyen ama biraz gecikmeli bir kuyruk, hiç
+ilerlemeyenden iyidir) ve gecikmeye duyarlı yük zaten bu kuyruğun arkasında
+beklemez.
 
 ```js
 limits: {

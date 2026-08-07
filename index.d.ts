@@ -226,6 +226,16 @@ export interface SendOptions {
   reliable?: boolean;
   ordered?: boolean;
   streamId?: number;
+  /** Gönderim kuyruğu bandı; 0 = en yüksek öncelik, varsayılan 2. */
+  priority?: number;
+  /**
+   * Mesajı kendi bandının BAŞINA koyar — bandı ATLAMAZ.
+   *
+   * Akış başlatan küçük çerçeveler içindir (tünelde OPEN/OPEN_ACK): bir
+   * bağlantının KURULMASI, aynı sınıftaki hacimli bir aktarımın kuyruk
+   * gecikmesini ödememelidir. Dört parçadan büyük mesajlarda yok sayılır.
+   */
+  expedite?: boolean;
 }
 
 export interface MessageMeta {
@@ -372,6 +382,19 @@ export interface RecoveryStats extends ReliableStats {
   /** Hedef gönderim hızı (bayt/s). Şekillendirme kapalıysa null. */
   pacingRateBps: number | null;
   pacingEnabled: boolean;
+  /** Şekillendiricinin patlama payı (bayt) ve karşılığı olan süre (ms). */
+  pacingBurstBytes?: number;
+  pacingBurstMs?: number;
+  pacingDelays?: number;
+  /**
+   * Ölçülen zamanlayıcı çözünürlüğü (ms) — `setTimeout`'un istenenden ne kadar
+   * geç uyandığı. 10'un üzerindeki değerler kaba tikli bir makineyi gösterir
+   * (tipik: Windows, 15.6 ms) ve patlama payının o kadar büyümesi BEKLENİR;
+   * büyümezse hat kullanılamıyor demektir.
+   */
+  timerLagMs?: number;
+  timerLagSamples?: number;
+  timerLagWorstMs?: number;
   /** Uygulama veri üretemediği için hattı boş bıraktık mı. */
   appLimited: boolean;
   /** BBR: bant genişliği-gecikme çarpımı (bayt). */

@@ -273,6 +273,96 @@ function makeMux(sock, limits = {}) {
     }
   });
 
+  await r.test('kuyruk bütçesi besleme biriminin ALTINA inmez', () => {
+    // Zamana bağlı bütçe tek başına bırakılırsa, hız düştükçe bütçe de düşer
+    // ve bir noktada segment boyutunun altına iner: hiçbir segment kuyruğa
+    // giremez, hiçbir şey ACK'lenmez, bütçe hiç serbest kalmaz. Kilitlenme
+    // tam da hattın en dar olduğu anda başlar — bu yüzden taban BAYT
+    // cinsindendir.
+    for (const [ad, bps] of [['1 Mbit', 125_000], ['256 kbit', 32_000], ['64 kbit', 8_000]]) {
+      const sock = fakeSocket({ cwnd: 64 * 1024, pacingRate: bps });
+      const mux = makeMux(sock, { targetQueueMs: 20 });
+
+      const allowance = mux._queueAllowance();
+      assert.ok(allowance >= LIMITS.SEGMENT_BYTES,
+                `${ad}: bütçe (${allowance}) bir segmentin altına inmemeli`);
+      assert.ok(allowance > LIMITS.SEGMENT_BYTES,
+                `${ad}: taban, kuyrukta bir segment varken bile besleme yapılmasına izin vermeli`);
+
+      // Ve gerçekten akıyor: en dar hatta bile veri kanala verilebilmeli.
+      const s = mux.openStream({ appId: 'web', qos: QOS.INTERACTIVE });
+      s.write(Buffer.alloc(256 * 1024));
+      assert.ok((dataFramesByStream(sock).get(s.id) || []).length > 0,
+                `${ad}: besleme kilitlenmemeli`);
+    }
+  });
+
+  // ========================================================================
+  // Yeni bağlantı — "indirme sürerken sayfa açılmıyor"
+  // ========================================================================
+  await r.test('yeni akış DRR sırasının BAŞINA girer', () => {
+    const sock = fakeSocket();
+    const mux = makeMux(sock);
+
+    // Aynı sınıfta üç hacimli aktarım: sıranın sonuna eklenen yeni bir akış,
+    // her birinin 32 KiB'lik kuantumunu beklerdi.
+    const bulks = [0, 1, 2].map(() => mux.openStream({ appId: 'web', qos: QOS.INTERACTIVE }));
+    for (const b of bulks) b.write(Buffer.alloc(2 * 1024 * 1024));
+
+    const before = sock.sent.length;
+    const visitor = mux.openStream({ appId: 'web', qos: QOS.INTERACTIVE });
+    visitor.write(Buffer.from('GET / HTTP/1.1\r\n\r\n'));
+
+    const after = sock.sent.slice(before).filter((s) => s.frame[0] === DATA.BYTES);
+    assert.ok(after.length > 0, 'yeni akışın ilk baytı çıkmalı');
+    assert.equal(after[0].opts.streamId, visitor.id,
+                 'yeni bağlantının ilk segmenti sıradaki İLK segment olmalı');
+  });
+
+  await r.test('yeni akış ayrıcalığı ömür boyu BİR KEREdir', () => {
+    const sock = fakeSocket();
+    const mux = makeMux(sock);
+
+    const older = mux.openStream({ appId: 'web', qos: QOS.INTERACTIVE });
+    const newer = mux.openStream({ appId: 'web', qos: QOS.INTERACTIVE });
+
+    older.write(Buffer.alloc(64 * 1024));
+    newer.write(Buffer.alloc(64 * 1024));
+    assert.ok(newer.bytesOut > 0, 'yeni akış ilk turunu almalı');
+
+    // Artık "yeni" değil: bir daha sıranın başına geçemez, yoksa her yazımdan
+    // önce kısa bir duraklama yapan bir akış hattı kalıcı olarak sahiplenirdi.
+    assert.equal(mux._isFresh(newer), false);
+    mux._deactivate(newer);
+    newer.write(Buffer.alloc(1024));
+    const band = mux.bands[QOS.INTERACTIVE];
+    assert.equal(band[band.length - 1], newer,
+                 'konuşmuş bir akış sıranın sonuna eklenmeli');
+  });
+
+  await r.test('açılış çerçeveleri kanala fast-track ile verilir', () => {
+    const sock = fakeSocket();
+    const mux = makeMux(sock);
+    const stream = mux.openStream({ appId: 'web', qos: QOS.INTERACTIVE });
+
+    mux.sendOpen(stream, { appIdx: 0, remoteAddress: '203.0.113.7', remotePort: 44321 });
+    const open = sock.sent[sock.sent.length - 1];
+    assert.equal(open.frame[0], DATA.OPEN);
+    assert.equal(open.opts.expedite, true, 'OPEN kuyruğun sonuna girmemeli');
+
+    mux.sendOpenAck(stream);
+    const ack = sock.sent[sock.sent.length - 1];
+    assert.equal(ack.frame[0], DATA.OPEN_ACK);
+    assert.equal(ack.opts.expedite, true,
+                 'OPEN_ACK gecikirse karşı taraf akışı OPEN_TIMEOUT ile düşürür');
+
+    // Veri çerçeveleri ayrıcalık ALMAZ: alsalardı ayrıcalık anlamsız olurdu.
+    stream.write(Buffer.alloc(1024));
+    const data = sock.sent[sock.sent.length - 1];
+    assert.equal(data.frame[0], DATA.BYTES);
+    assert.ok(!data.opts.expedite, 'veri çerçevesi açılış ayrıcalığı almamalı');
+  });
+
   // ========================================================================
   // Kanal katmanı: öncelik gerçekten aşağı iniyor mu
   // ========================================================================
@@ -292,6 +382,54 @@ function makeMux(sock, limits = {}) {
     assert.equal(nextChunk.streamId, 2,
                  'gerçek zamanlı parça, kuyruktaki hacimli parçaların önüne geçmeli');
     assert.equal(wire.length, afterBulk, 'pencere dolu: yeni paket henüz çıkmamalı');
+  });
+
+  await r.test('akış başlatan çerçeve aynı bandın hacimli verisini ATLAR', () => {
+    // Süren bir indirme ile yeni bir sekme AYNI sınıftadır (etkileşimli).
+    // Bandı yükseltmeden, yalnızca bandın başına geçerek çözülür.
+    const wire = [];
+    const ch = new ReliableChannel({ mtu: 300, send: (b) => wire.push(b) });
+
+    ch.sendMessage(Buffer.alloc(64 * 1024), { streamId: 1, priority: QOS.INTERACTIVE });
+    assert.ok(ch.queuedChunks > 0, 'indirme kuyrukta beklemeli');
+    assert.equal(ch.chunks.get(ch._peek()).streamId, 1);
+
+    ch.sendMessage(Buffer.from([DATA.OPEN, 0, 0]), {
+      streamId: 2, priority: QOS.INTERACTIVE, expedite: true,
+    });
+    assert.equal(ch.chunks.get(ch._peek()).streamId, 2,
+                 'açılış çerçevesi, aynı bandın hacimli verisinin önüne geçmeli');
+  });
+
+  await r.test('fast-track bandı ATLAMAZ', () => {
+    // Ayrıcalık bant İÇİNDEdir: etkileşimli bir açılış, gerçek zamanlı bir
+    // paketin önüne geçemez. Aksi hâlde her yeni bağlantı oyun trafiğini
+    // bölerdi.
+    const wire = [];
+    const ch = new ReliableChannel({ mtu: 300, send: (b) => wire.push(b) });
+
+    ch.sendMessage(Buffer.alloc(64 * 1024), { streamId: 1, priority: QOS.BULK });
+    ch.sendMessage(Buffer.from('oyun'), { streamId: 2, priority: QOS.REALTIME });
+    ch.sendMessage(Buffer.from([DATA.OPEN, 0, 0]), {
+      streamId: 3, priority: QOS.INTERACTIVE, expedite: true,
+    });
+
+    assert.equal(ch.chunks.get(ch._peek()).streamId, 2,
+                 'gerçek zamanlı paket en önde kalmalı');
+  });
+
+  await r.test('fast-track veri taşımak için kullanılamaz', () => {
+    // Ayrıcalık küçük çerçevelerle sınırlı: "acil" işaretli 32 KiB'lik bir
+    // mesaj bandın tamamını atlayabilseydi bandın bir anlamı kalmazdı.
+    const wire = [];
+    const ch = new ReliableChannel({ mtu: 300, send: (b) => wire.push(b) });
+
+    ch.sendMessage(Buffer.alloc(64 * 1024), { streamId: 1, priority: QOS.INTERACTIVE });
+    ch.sendMessage(Buffer.alloc(32 * 1024), {
+      streamId: 2, priority: QOS.INTERACTIVE, expedite: true,
+    });
+    assert.equal(ch.chunks.get(ch._peek()).streamId, 1,
+                 'hacimli mesaj "acil" işaretiyle sıra atlayamamalı');
   });
 
   await r.test('yeniden gönderim KENDİ bandının başına döner', () => {

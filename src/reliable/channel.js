@@ -30,6 +30,7 @@
 //   PONG 0x04 | token(4)
 
 const { EventEmitter } = require('node:events');
+const { performance } = require('node:perf_hooks');
 const { LossRecovery, DEFAULT_CONGESTION_CONTROL } = require('./recovery.js');
 
 const FRAME = Object.freeze({ RAW: 0x00, DATA: 0x01, ACK: 0x02, PING: 0x03, PONG: 0x04 });
@@ -89,6 +90,17 @@ const DEFAULTS = Object.freeze({
 
 /** Hız şekillendirici beklerken zamanlayıcının aşmayacağı süre. */
 const MAX_PACING_TIMER_MS = 250;
+
+/**
+ * `expedite` ile kendi bandının BAŞINA alınabilecek azami parça sayısı.
+ *
+ * Fast-track, akış BAŞLATAN küçük çerçeveler içindir (OPEN/OPEN_ACK ve yeni
+ * bir akışın reddi). Sınır olmasaydı çağıran, hacimli bir mesajı "acil"
+ * işaretleyip bandın tamamını atlayabilirdi — yani bandın anlamını yok
+ * ederdi. Dört parça ≈ 4 KB: her açılış çerçevesi buna rahatça sığar,
+ * hiçbir veri bloğu sığmaz.
+ */
+const MAX_EXPEDITE_CHUNKS = 4;
 
 // Alıcı, iki ACK bekleyen paketten sonra ACK'i geciktirmeden gönderir
 // (RFC 9000 §13.2.1) — kurtarma turunu kısaltan en ucuz iyileştirme.
@@ -200,8 +212,12 @@ class ReliableChannel extends EventEmitter {
   /**
    * Güvenilir mesaj gönderir. Tüm parçalar ACK'lenince çözülen Promise döner.
    * @param {Buffer} data
-   * @param {{ordered?:boolean, streamId?:number, priority?:number}} [opt]
+   * @param {{ordered?:boolean, streamId?:number, priority?:number, expedite?:boolean}} [opt]
    *   `priority` 0 = en yüksek. Verilmezse 2 (etkileşimli).
+   *
+   *   `expedite` — mesajı kendi bandının BAŞINA koyar (bandı ATLAMAZ).
+   *   Yalnızca AKIŞ BAŞLATAN küçük çerçeveler içindir; gerekçesi ve neden
+   *   sıralamayı bozmadığı `_enqueueMessage`'ta.
    */
   sendMessage(data, opt = {}) {
     if (this.closed) return Promise.reject(new Error('kanal kapalı'));
@@ -224,6 +240,7 @@ class ReliableChannel extends EventEmitter {
     const promise = new Promise((res, rej) => { record.resolve = res; record.reject = rej; });
     this.messages.set(msgKey, record);
 
+    const keys = new Array(count);
     for (let i = 0; i < count; i++) {
       const chunkKey = `${msgKey}:${i}`;
       this.chunks.set(chunkKey, {
@@ -231,11 +248,53 @@ class ReliableChannel extends EventEmitter {
         payload: data.subarray(i * payloadMax, Math.min((i + 1) * payloadMax, data.length)),
         attempts: 0,
       });
-      this._enqueue(chunkKey, priority, false);
+      keys[i] = chunkKey;
     }
+    this._enqueueMessage(keys, priority, opt.expedite === true);
 
     this._pump();
     return promise;
+  }
+
+  /**
+   * Bir mesajın parçalarını bandına yerleştirir.
+   *
+   * FAST-TRACK (`expedite`) — akış başlatan çerçevelerin varlık sebebi:
+   *
+   * Bandın kuyruğu FIFO'dur ve bu, aynı sınıftaki iki akış için doğrudur:
+   * 16 KiB'lik segmentler hâlinde beslenen bir aktarımın parçaları bandın
+   * içinde sırayla ilerler. Ama YENİ BİR AKIŞIN AÇILIŞ ÇERÇEVESİ o kuyruğun
+   * sonuna girdiğinde, önündeki her şey boşalana kadar bekler — ve karşı taraf
+   * o çerçeveyi görmeden yerel bağlantıyı hiç kurmaz. Sonuç, bir bağlantının
+   * KURULMASININ hacimli bir aktarımın kuyruk gecikmesini yemesidir: aktarım
+   * sürerken açılan sayfa "yavaş" değil, AÇILMAZ (OPEN_TIMEOUT_MS dolar ve
+   * akış düşürülür).
+   *
+   * Bandı yükseltmek yanlış cevap olurdu: açılış çerçevesi kredi/kalp atışı
+   * kadar kritik değildir ve CONTROL bandına girmesi, veri düzleminin denetim
+   * düzlemini kirletmesi demek olurdu. Doğru cevap, KENDİ bandının başına
+   * geçmek: gerçek zamanlı trafiğin önüne geçmez, yalnızca aynı sınıftaki
+   * hacimli verinin arkasında beklemez.
+   *
+   * SIRALAMAYI NEDEN BOZMAZ? Kanalın sıra garantisi AKIŞ BAŞINADIR ve akış
+   * başlatan çerçeve, tanımı gereği o akışın İLK mesajıdır (msgId=1) — kendi
+   * akışında önüne geçebileceği bir şey yoktur. Farklı akışların çerçeveleri
+   * arasında sıra zaten garanti edilmez (ve edilmemelidir). Alıcı tarafta
+   * sıralı teslim msgId üzerinden yürüdüğü için, bir aktarımın parçalarıyla
+   * araya giren açılış çerçevesi hiçbir şeyi karıştırmaz.
+   *
+   * @param {string[]} keys parça anahtarları (mesaj sırasında)
+   */
+  _enqueueMessage(keys, priority, expedite) {
+    // Fast-track yalnızca KÜÇÜK mesajlar için: sınır, ayrıcalığın veri
+    // taşımak için kullanılmasını engeller.
+    if (expedite && keys.length <= MAX_EXPEDITE_CHUNKS) {
+      // Ters sırada başa eklemek, parçaların bandın başında DOĞRU sırayla
+      // dizilmesini sağlar.
+      for (let i = keys.length - 1; i >= 0; i--) this._enqueue(keys[i], priority, true);
+      return;
+    }
+    for (const key of keys) this._enqueue(key, priority, false);
   }
 
   /**
@@ -327,7 +386,9 @@ class ReliableChannel extends EventEmitter {
       if (wait > 0) { this._armPacingTimer(wait); break; }
 
       this._dequeue();
-      this._transmit(chunk);
+      // Turun damgası aşağı geçirilir: şekillendiricinin "izin var mı" ve
+      // "gönderdim" hesapları AYNI ana bakmalı (bkz. `_transmit`).
+      this._transmit(chunk, now);
     }
 
     // Kuyruk boşaldı: bundan sonraki teslim hızı örnekleri AĞIN değil
@@ -338,10 +399,24 @@ class ReliableChannel extends EventEmitter {
     this._rearmTimer();
   }
 
+  /**
+   * Hız sınırı beklemesi.
+   *
+   * Uyanışta zamanlayıcının GERÇEKTE ne kadar uyuduğu ölçülüp şekillendiriciye
+   * bildirilir. Ölçüm MONOTONİK saatle (`performance.now`) yapılır: `Date.now`
+   * bir NTP düzeltmesinde geriye atlayabilir ve tek bir sıçrama, kova
+   * kapasitesini saniyelerce yanlış boyutlandırırdı. Ölçümün ne işe yaradığı
+   * ve olmadığında ne olduğu pacing.js'in başında.
+   */
   _armPacingTimer(ms) {
     if (this.pacingTimer || this.closed) return;
     const delay = Math.max(1, Math.min(Math.ceil(ms), MAX_PACING_TIMER_MS));
-    this.pacingTimer = setTimeout(() => { this.pacingTimer = null; this._pump(); }, delay);
+    const armedAt = performance.now();
+    this.pacingTimer = setTimeout(() => {
+      this.pacingTimer = null;
+      this.recovery.noteTimerWake(delay, performance.now() - armedAt);
+      this._pump();
+    }, delay);
     if (this.pacingTimer.unref) this.pacingTimer.unref();
   }
 
@@ -374,7 +449,15 @@ class ReliableChannel extends EventEmitter {
     }
   }
 
-  _transmit(chunk) {
+  /**
+   * @param {number} [now] gönderim anı.
+   *
+   * Çağıranın damgasını AYNEN aşağı geçirmek önemli: hız şekillendirici hem
+   * "gönderebilir miyim" sorusunda hem de "gönderdim" muhasebesinde jeton
+   * doldurur. İkisi farklı damgalar kullanırsa kova aynı zaman aralığını iki
+   * kez sayabilir ve şekillendirme hedeflenen hızın üstüne çıkar.
+   */
+  _transmit(chunk, now = Date.now()) {
     const pn = this.nextPn++;
     const frame = Buffer.allocUnsafe(DATA_HEADER_LEN + chunk.payload.length);
     frame[0] = FRAME.DATA;
@@ -391,7 +474,9 @@ class ReliableChannel extends EventEmitter {
     this.stats.sent++;
     this.stats.bytesSent += frame.length;
 
-    this.recovery.onPacketSent({ pn, bytes: frame.length, ackEliciting: true, meta: chunk.key });
+    this.recovery.onPacketSent({
+      pn, bytes: frame.length, ackEliciting: true, meta: chunk.key, now,
+    });
     this._write(frame);
   }
 
@@ -820,4 +905,5 @@ module.exports = {
   ReliableChannel, LossRecovery, FRAME,
   PRIORITY_BANDS, DEFAULT_PRIORITY, clampPriority,
   DATA_HEADER_LEN, ACK_HEADER_LEN, ACK_RANGE_LEN, PING_LEN, DEFAULTS,
+  MAX_EXPEDITE_CHUNKS, MAX_PACING_TIMER_MS,
 };
