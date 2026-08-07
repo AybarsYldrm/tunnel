@@ -447,6 +447,14 @@
         ['Model durumu', link.ccState || '—'],
         ['Kayıp', (link.lossRate * 100).toFixed(3) + '% · ' + link.retransmits + ' yeniden gönderim'],
         ['Kuyruk (kanal)', bytes(link.channelQueuedBytes || 0) + ' / ' + bytes(link.queueAllowanceBytes || 0)],
+        // Sapma milisaniyenin altında anlamlıdır: 1.2 ms ile 15.6 ms arasındaki
+        // fark, hattın tamamı ile onda biri arasındaki farktır.
+        ['Patlama payı', link.pacingBurstBytes
+          ? bytes(link.pacingBurstBytes) + ' · ' + Number(link.pacingBurstMs).toFixed(1) + ' ms'
+          : '—'],
+        ['Zamanlayıcı sapması', link.timerLagMs == null
+          ? '—'
+          : Number(link.timerLagMs).toFixed(1) + ' ms'],
         ['Sırada (sınıfa göre)', (link.queuedByBand || []).join(' · ') || '—'],
       ]),
       section('Trafik', [

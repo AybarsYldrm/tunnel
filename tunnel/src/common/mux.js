@@ -54,6 +54,44 @@ const STARVATION_GUARD_MS = 50;
  * engeller.
  */
 const REALTIME_QUEUE_FACTOR = 4;
+/**
+ * Henüz tek bayt göndermemiş bir akışın kanal kuyruğu payı, diğerlerinin kaç
+ * katı.
+ *
+ * Bir bağlantının İLK segmenti, ömrü boyunca göndereceği en kritik segmenttir:
+ * HTTP istek satırı, TLS ClientHello, SSH sürüm dizesi. O segment "kanal
+ * kuyruğu dolu" diye bekletildiğinde kaybedilen şey bant genişliği değil,
+ * bağlantının KURULMA süresidir. Payı ikiye katlamak, süren bir aktarım
+ * kuyruğu tam sınırda tutarken bile yeni akışın ilk segmentine yer bırakır.
+ *
+ * Neden sınırsız değil: ayrıcalık akış başına BİR KEREdir (ilk bayt gidince
+ * biter) ama eşzamanlı yeni akış sayısı sınırsız olabilir. Çarpan, en kötü
+ * durumda bile kuyruğun `maxOutstandingBytes` tavanının altında kalmasını
+ * garanti eder.
+ */
+const FRESH_QUEUE_FACTOR = 2;
+/**
+ * Yeni akışların bandın başına dizilirken taranacak azami eleman sayısı.
+ *
+ * Yeni akış, bandın başına ama KENDİNDEN ÖNCE gelen diğer yeni akışların
+ * arkasına girer (yeniler arasında FIFO — aksi hâlde bir bağlantı seli
+ * ilk gelenleri en sona atardı). Taramayı sınırlamak, eşzamanlı binlerce
+ * açılışta ekleme maliyetinin O(n²)'ye çıkmasını engeller; sınır aşılırsa
+ * davranış "biraz daha geriye ekle"ye yumuşakça bozulur.
+ */
+const FRESH_SCAN_LIMIT = 64;
+/**
+ * Kanal kuyruğu tabanının segment üstüne eklediği pay (MTU katı).
+ *
+ * Taban tam olarak bir segmente eşit olsaydı, bir segment kuyruğa girer girmez
+ * besleme durur ve kanal, o segmentin ACK'i gelene kadar SIRADAKİ akıştan tek
+ * bayt alamazdı: DRR turu, ağ turu hızında ilerlerdi. Bir MTU'luk pay bu
+ * kilitlenmeyi açar — kuyrukta her zaman "bir segment + biraz" yer kalır,
+ * yani bir akışın segmenti kuyruktayken diğeri kendi segmentini verebilir.
+ */
+const QUEUE_FLOOR_MTUS = 1;
+/** Kanalın MTU'su okunamazsa kullanılan güvenli varsayım. */
+const ASSUMED_MTU = 1200;
 /** Yazma kuyruğu bu boyutu aşınca `write()` false döner (geri basınç sinyali). */
 const STREAM_HIGH_WATER = 512 * 1024;
 /** Biriken kredileri toplu göndermek için bekleme. */
@@ -364,6 +402,20 @@ class Mux extends EventEmitter {
   // Zamanlayıcı (DRR + tıkanıklık bütçesi + hız şekillendirme)
   // -------------------------------------------------------------------------
 
+  /**
+   * Akışı bandının sırasına sokar.
+   *
+   * YENİ AKIŞ, SIRANIN BAŞINA GİRER. Gerekçe: DRR aynı sınıftaki akışlar
+   * arasında BANT GENİŞLİĞİNİ adil böler, ama yeni bir bağlantının ihtiyacı
+   * bant genişliği değil, İLK TURU KAÇIRMAMAKTIR. Sıranın sonuna eklenen yeni
+   * bir akış, önündeki her akışın 32 KiB'lik kuantumunu bekler; hat sıkışıkken
+   * bu, bağlantının kurulmasının saniyelere yayılması demektir. Başa eklemek
+   * bu bekleyişi kaldırır ve adaleti bozmaz: akış bir kuantum kullanır ve
+   * `_rotate` ile sıranın sonuna gider — ayrıcalık ömür boyu BİR KEREdir.
+   *
+   * Yeniler kendi aralarında FIFO'dur: bir bağlantı seli, ilk gelenleri en
+   * sona atmamalı.
+   */
   _activate(stream) {
     if (stream.inActive || stream.closed) return;
     stream.inActive = true;
@@ -372,7 +424,11 @@ class Mux extends EventEmitter {
     // saatlerdir boş duran bir bant, ilk paketinde "açlıktan ölüyorum" diyip
     // üst bandın önüne geçerdi.
     if (band.length === 0) this.bandLastServed[stream.priority] = Date.now();
-    band.push(stream);
+
+    if (band.length === 0 || !this._isFresh(stream)) { band.push(stream); return; }
+    let i = 0;
+    while (i < band.length && i < FRESH_SCAN_LIMIT && this._isFresh(band[i])) i++;
+    band.splice(i, 0, stream);
   }
 
   _deactivate(stream) {
@@ -417,11 +473,27 @@ class Mux extends EventEmitter {
     let best = -1;
     for (let b = 0; b < this.bands.length; b++) {
       if (this.bands[b].length === 0) continue;
-      if (!this._canFeedChannel(b)) continue;
+      // Besleme sınırı bandın SIRADAKİ akışına göre değerlendirilir: yeni bir
+      // akışın ilk segmenti, süren bir aktarımın doldurduğu kuyruk yüzünden
+      // beklememeli (bkz. FRESH_QUEUE_FACTOR).
+      if (!this._canFeedChannel(b, this.bands[b][0])) continue;
       if (best < 0) { best = b; continue; }
       if (now - this.bandLastServed[b] > STARVATION_GUARD_MS) return b;
     }
     return best;
+  }
+
+  /**
+   * Bu akış ömrü boyunca hiç veri göndermedi mi?
+   *
+   * "Yeni bağlantı" ile "sessiz kalmış eski bağlantı" arasındaki ayrım tam
+   * olarak burada. Ölçüt bilerek `bytesOut === 0`: akış BİR KEZ konuştuktan
+   * sonra ayrıcalığını kalıcı olarak kaybeder. Ölçüt "son N ms'dir sessiz"
+   * olsaydı, her yazımdan önce bekleyen bir akış ayrıcalığı sürekli geri
+   * kazanır ve sıra bir daha hiç ilerlemezdi.
+   */
+  _isFresh(stream) {
+    return stream !== undefined && stream.bytesOut === 0 && !stream.closed;
   }
 
   /**
@@ -433,13 +505,27 @@ class Mux extends EventEmitter {
    * yeni giren her baytın ALTI SANİYE beklemesi demektir. Zamana bağlanınca
    * hattın hızı değişse de kuyruğun ürettiği gecikme sabit kalır.
    *
-   * Alt sınır neden var? Kuyruk tamamen boşalırsa ACK geldiği anda gönderilecek
-   * veri bulunmaz ve hat, bir sonraki besleme turuna kadar boş kalır. İki
-   * segment, bunu engelleyecek en küçük tampon.
+   * TABAN BAYT SINIRI — neden zaman tek başına yetmiyor.
+   *
+   * Bütçe yalnızca zamandan türetilseydi, hız düştükçe bütçe de düşerdi ve bir
+   * noktada BESLEME BİRİMİNİN ALTINA inerdi: 1 Mbit'lik bir hatta 20 ms yalnızca
+   * ~2.5 KB'dir, oysa bir akışa tek seferde verilen segment 16 KB'dir. Bütçe
+   * segmentten küçük olduğu anda hiçbir segment kuyruğa giremez; kuyruk boş
+   * kalır, kuyruk boş olduğu için hiçbir şey ACK'lenmez, ACK gelmediği için de
+   * bütçe hiç serbest kalmaz. Bu bir yavaşlama değil KİLİTLENMEDİR ve tam da
+   * hattın en dar olduğu anda devreye girer.
+   *
+   * Bu yüzden taban BAYT cinsindendir ve besleme birimine bağlıdır: bir segment
+   * artı bir MTU (bkz. QUEUE_FLOOR_MTUS). Taban devreye girdiğinde kuyruğun
+   * ürettiği gecikme `targetQueueMs`'i aşar — bu bilinçli bir takastır:
+   * ilerleyen ama biraz gecikmeli bir kuyruk, hiç ilerlemeyen bir kuyruktan
+   * her koşulda iyidir. Gecikmeye duyarlı yük zaten bu kuyruğun ARKASINDA
+   * beklemez: kanalın kendi kuyruğu da önceliklidir ve akış başlatan
+   * çerçeveler fast-track ile öne geçer.
    */
   _queueAllowance() {
     const ch = this.socket.reliable;
-    const floor = this.segmentBytes * 2;
+    const floor = this._queueFloor();
     if (!ch) return floor;
     const rate = ch.pacingRate;
     if (!rate) {
@@ -447,11 +533,16 @@ class Mux extends EventEmitter {
       return Math.max(floor, Math.min(ch.congestionWindow || 0, this.maxOutstandingBytes));
     }
     const byTime = Math.floor((rate * this.targetQueueMs) / 1000);
-    // Taban, hedef süreden BÜYÜK olmamalı. Sabit "iki segment" bir tabanı,
-    // 5 Mbit'lik bir hatta 51 ms kuyruk demektir — yani hattın yavaşlığı
-    // hedefi delerdi. Kanalın aç kalmaması için bir segment yeter.
-    const adaptiveFloor = Math.min(floor, Math.max(this.segmentBytes, byTime));
-    return Math.max(adaptiveFloor, Math.min(byTime, this.maxOutstandingBytes));
+    return Math.max(floor, Math.min(byTime, this.maxOutstandingBytes));
+  }
+
+  /** Kuyruk bütçesinin altına inemeyeceği bayt tabanı. */
+  _queueFloor() {
+    const ch = this.socket.reliable;
+    const mtu = (ch && ch.opts && ch.opts.mtu) || ASSUMED_MTU;
+    // Tavanı da aşmamalı: `maxOutstandingBytes` bellek sınırıdır ve taban onu
+    // delemez (aksi hâlde taban, bellek tavanını anlamsız kılardı).
+    return Math.min(this.maxOutstandingBytes, this.segmentBytes + QUEUE_FLOOR_MTUS * mtu);
   }
 
   /**
@@ -467,7 +558,7 @@ class Mux extends EventEmitter {
    * öncelikli olduğu için paket oraya girdiği anda en öne geçer. Onu üst
    * katmanda bekletmek, koruduğumuz şeyi bozardı.
    */
-  _canFeedChannel(band = QOS.INTERACTIVE) {
+  _canFeedChannel(band = QOS.INTERACTIVE, head = undefined) {
     if (this.outstandingBytes >= this.maxOutstandingBytes) return false;
     const ch = this.socket.reliable;
     if (!ch) return this.outstandingBytes < this.segmentBytes * 8;
@@ -476,9 +567,15 @@ class Mux extends EventEmitter {
     if (band <= QOS.REALTIME) {
       // Yine de sınırsız değil: kendi içinde baş-tıkanması yapan bir gerçek
       // zamanlı akış da istemiyoruz, belleği de sınırsız bırakamayız.
-      allowance = Math.min(allowance * REALTIME_QUEUE_FACTOR, this.maxOutstandingBytes);
+      allowance *= REALTIME_QUEUE_FACTOR;
+    } else if (this._isFresh(head)) {
+      // Sıradaki akış henüz tek bayt göndermedi: ilk segmenti, aynı sınıftaki
+      // süren bir aktarımın doldurduğu kuyruğun ARKASINDA beklememeli.
+      allowance *= FRESH_QUEUE_FACTOR;
     }
-    return ch.queuedBytes < allowance;
+    // Her iki ayrıcalık da sert bellek tavanının ALTINDA kalır: öncelik,
+    // alıcı belleğini şişirme hakkı değildir.
+    return ch.queuedBytes < Math.min(allowance, this.maxOutstandingBytes);
   }
 
   _pump() {
@@ -493,7 +590,13 @@ class Mux extends EventEmitter {
     let guard = 0;
 
     for (;;) {
-      if (++guard > 10_000) break;              // ilerleme yoksa döngüyü bırak
+      if (++guard > 10_000) {
+        // Tek turda çok fazla iş: olay döngüsünü aç ve kaldığı yerden devam et.
+        // Zamanlayıcı KURULMADAN çıkmak, kuyrukta veri varken pompayı yalnızca
+        // bir sonraki yazıma/ACK'e bağlamak olurdu — ikisi de gelmeyebilir.
+        if (rateWaitMs <= 0) rateWaitMs = 1;
+        break;
+      }
 
       const now = Date.now();
       const band = this._selectBand(now);
@@ -632,7 +735,12 @@ class Mux extends EventEmitter {
   // Gönderim
   // -------------------------------------------------------------------------
 
-  _sendOnStream(stream, frame, accountedBytes) {
+  /**
+   * @param {boolean} [expedite] akış başlatan çerçeve: kendi bandının başına
+   *   geçer (bandı atlamaz). Ayrıntı ve sıra güvenliği: channel.js
+   *   `_enqueueMessage`.
+   */
+  _sendOnStream(stream, frame, accountedBytes, expedite = false) {
     if (this.closed) return;
     this.outstandingBytes += accountedBytes;
     this.meterOut.add(frame.length);
@@ -641,6 +749,7 @@ class Mux extends EventEmitter {
     try {
       promise = this.socket.send(frame, {
         streamId: stream.id, ordered: true, reliable: true, priority: stream.priority,
+        expedite,
       });
     } catch (err) {
       this.outstandingBytes -= accountedBytes;
@@ -673,13 +782,26 @@ class Mux extends EventEmitter {
   /**
    * Akışı karşı tarafa duyurur. Akışın İLK mesajıdır; hemen ardından yazılan
    * veri onun arkasına sıralanır, yani açılış onayını beklemeye gerek yoktur.
+   *
+   * FAST-TRACK: bu çerçeve kendi bandının başına konur. Bir bağlantının
+   * kurulması, aynı sınıftaki hacimli bir aktarımın kuyruk gecikmesini
+   * ödememelidir — ödediğinde sonuç "yavaş açılan sayfa" değil, OPEN_TIMEOUT
+   * dolduğu için DÜŞÜRÜLEN bağlantıdır.
    */
   sendOpen(stream, { appIdx, remoteAddress, remotePort }) {
-    this._sendOnStream(stream, frames.frameOpen({ appIdx, remoteAddress, remotePort }), 0);
+    this._sendOnStream(stream, frames.frameOpen({ appIdx, remoteAddress, remotePort }), 0, true);
   }
 
+  /**
+   * Yerel hedefe bağlanıldı.
+   *
+   * Bu da fast-track'tir ve sebebi OPEN'dan bile keskin: karşı taraf bu
+   * çerçeveyi `OPEN_TIMEOUT_MS` içinde görmezse akışı RESET'ler. Onay, ters
+   * yöndeki aktarımın kuyruğunda beklerse, YEREL BAĞLANTI KURULMUŞ OLMASINA
+   * RAĞMEN bağlantı düşürülür.
+   */
   sendOpenAck(stream) {
-    this._sendOnStream(stream, frames.frameOpenAck(), 0);
+    this._sendOnStream(stream, frames.frameOpenAck(), 0, true);
   }
 
   /**
@@ -845,8 +967,10 @@ class Mux extends EventEmitter {
       // açıkça söylemek gerekir: sessizlik, orada bir bağlantının süresiz
       // beklemesi demek olurdu.
       try {
+        // Red de açılışın bir parçasıdır: karşı taraftaki bağlantı bu çerçeveyi
+        // görene kadar bekler. Kuyruğa girmesi, reddi zaman aşımına çevirirdi.
         const p = this.socket.send(frames.frameRst(RST_CODE.RATE_LIMITED), {
-          streamId, ordered: true, reliable: true, priority: QOS.CONTROL,
+          streamId, ordered: true, reliable: true, priority: QOS.CONTROL, expedite: true,
         });
         if (p && typeof p.catch === 'function') p.catch(() => {});
       } catch { /* oturum kapanmış */ }
@@ -985,6 +1109,12 @@ class Mux extends EventEmitter {
       /** BBR'ın ölçtüğü darboğaz bant genişliği (bayt/s) — NewReno'da null. */
       bandwidthBps: channel ? (channel.bandwidthBps || null) : null,
       pacingRateBps: channel ? (channel.pacingRateBps || null) : null,
+      /** Şekillendiricinin patlama payı ve onu belirleyen zamanlayıcı ölçümü.
+       *  `timerLagMs` 10'un üzerindeyse makine kaba tikli (tipik: Windows) —
+       *  patlama payı buna göre büyümüş olmalı, yoksa hat kullanılamıyordur. */
+      pacingBurstBytes: channel ? (channel.pacingBurstBytes ?? null) : null,
+      pacingBurstMs: channel ? (channel.pacingBurstMs ?? null) : null,
+      timerLagMs: channel ? (channel.timerLagMs ?? null) : null,
       congestionWindow: channel ? channel.congestionWindow : null,
       bytesInFlight: channel ? channel.bytesInFlight : null,
       packetsLost: channel ? channel.packetsLost : null,
@@ -1028,5 +1158,6 @@ function normalizePriority(qos) {
 
 module.exports = {
   Mux, TunnelStream, SCHED_QUANTUM, REALTIME_QUANTUM, STREAM_HIGH_WATER,
-  STARVATION_GUARD_MS, REALTIME_QUEUE_FACTOR, normalizePriority,
+  STARVATION_GUARD_MS, REALTIME_QUEUE_FACTOR, FRESH_QUEUE_FACTOR,
+  QUEUE_FLOOR_MTUS, normalizePriority,
 };

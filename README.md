@@ -504,9 +504,25 @@ Uygulanan BBRv3 mekanizmaları:
   BDP'de kalırsa hat ACK'ler arasında boş kalır; fark ölçülüp pencereye eklenir.
 * **ProbeRTT** — `min_rtt` 10 saniyedir tazelenmediyse pencere 200 ms boyunca
   yarı BDP'ye indirilip gerçek gecikme ölçülür (%2'den az verim maliyeti).
-* **Pacing** — jeton kovası; ~1 ms'lik patlama payı bırakılır, çünkü paket başına
-  zamanlayıcı kurmak Node'un 1 ms çözünürlüğünde ~10 Mbit'lik yapay bir tavan
-  yaratırdı. Bant genişliği örneği oluşana kadar hız sınırı yoktur.
+* **Pacing** — jeton kovası; paket başına zamanlayıcı kurmak Node'un
+  çözünürlüğünde yapay bir tavan yaratacağı için küçük bir patlama payı
+  bırakılır. Bant genişliği örneği oluşana kadar hız sınırı yoktur.
+* **Zamanlayıcı çözünürlüğü telafisi** — patlama payı sabit değil, **ölçülür**.
+  Kovanın kapasitesi iki uyanma arasında biriken hakkın tavanıdır; sabit ~1 ms
+  varsaymak `setTimeout(1)`'in gerçekten 1 ms sürdüğünü varsaymaktır. Windows'ta
+  bu süre **15.6 ms**'dir ve fark doğrudan verime yansır:
+
+  ```
+  gerçek hız ≈ hedef × (kova_süresi / uyanma_aralığı)
+  25 Mbit    × (1 ms / 15.6 ms)  ≈  1.6 Mbit
+  ```
+
+  Şekillendirici her uyandığında "şu kadar istemiştim, şu kadar uyudum"
+  bilgisini geri alır; kova o makinenin gerçek uyanma aralığına göre boyutlanır.
+  Ölçüm **pencereli maksimumla** tutulur (ortalama değil: kovanın en kötü
+  uyanma aralığını karşılaması gerekir) ve üç sınırla bağlanır — telafi tavanı
+  (`maxBurstMs`, 25 ms), mutlak bayt tavanı (`maxBurstBytes`) ve tıkanıklık
+  penceresi. Ölçüm `timerLagMs` olarak raporlanır.
 * **Uygulama sınırı işaretleme** — gönderilecek veri kalmadığında örnekler
   `app-limited` damgalanır; aksi hâlde BBR, boş kalan hattı yavaş bir hat sanar.
 

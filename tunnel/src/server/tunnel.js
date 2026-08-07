@@ -599,6 +599,13 @@ class Tunnel extends EventEmitter {
         channelQueuedBytes: mux.channelQueuedBytes,
         queueAllowanceBytes: mux.queueAllowanceBytes,
         queuedByBand: mux.queuedByBand,
+        // Hız şekillendiricinin patlama payı ve onu belirleyen zamanlayıcı
+        // ölçümü. Bu iki sayı, "hat boş ve kayıp yok ama hız düşük" arızasının
+        // TEK teşhis noktasıdır: `timerLagMs` yüksekken `pacingBurstMs` de
+        // yükselmemişse şekillendirici hattı kendi kendine kısıyordur.
+        pacingBurstBytes: mux.pacingBurstBytes,
+        pacingBurstMs: mux.pacingBurstMs,
+        timerLagMs: mux.timerLagMs,
         packetsSent: mux.packetsSent,
         packetsLost: mux.packetsLost,
         retransmits: mux.retransmits,

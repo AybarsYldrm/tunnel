@@ -15,6 +15,23 @@
 // sürekli bekletilirdi. Kapasite bir "patlama bütçesi"dir: kullanılmayan
 // kapasitenin sınırlı bir kısmını biriktirmeye izin verir.
 
+/**
+ * Kovanın taşıyabileceği ASGARİ süre (ms) — zamanlayıcı çözünürlüğü payı.
+ *
+ * Kova kapasitesi, iki uyanma arasında biriken hakkın tavanıdır. Kapasite bir
+ * uyanma aralığından küçükse, aradaki fark her turda sessizce çöpe gider ve
+ * şekillendirici hedeflenen hızın ALTINDA bir tavan uygular:
+ *
+ *     gerçek hız ≈ hedef × (kapasite_süresi / uyanma_aralığı)
+ *
+ * Node'un zamanlayıcısı Windows'ta ~15.6 ms, yük altında daha da kaba
+ * çalışır (ayrıntı: src/reliable/pacing.js). 25 ms'lik taban, o tikin
+ * tamamını ve bir miktar oynamayı karşılar; yönetim panelinden konan bir
+ * sınırın, işletim sisteminin saat tikine bağlı olarak kendi kendini
+ * daraltmasını engeller.
+ */
+const MIN_BUCKET_MS = 25;
+
 class TokenBucket {
   /**
    * @param {object} o
@@ -23,17 +40,24 @@ class TokenBucket {
    */
   constructor({ ratePerSec, burst }) {
     this.ratePerSec = Math.max(0, ratePerSec || 0);
-    this.capacity = Math.max(1, burst || Math.ceil(this.ratePerSec / 4) || 1);
+    this.capacity = this._capacityFor(burst);
     this.tokens = this.capacity;
     this.last = Date.now();
   }
 
   get unlimited() { return this.ratePerSec <= 0; }
 
+  /** İstenen patlama payını zamanlayıcı tabanıyla birlikte değerlendirir. */
+  _capacityFor(burst) {
+    const asked = burst || Math.ceil(this.ratePerSec / 4) || 1;
+    const timerFloor = Math.ceil((this.ratePerSec * MIN_BUCKET_MS) / 1000);
+    return Math.max(1, asked, timerFloor);
+  }
+
   setRate(ratePerSec, burst) {
     this._refill(Date.now());
     this.ratePerSec = Math.max(0, ratePerSec || 0);
-    this.capacity = Math.max(1, burst || Math.ceil(this.ratePerSec / 4) || 1);
+    this.capacity = this._capacityFor(burst);
     if (this.tokens > this.capacity) this.tokens = this.capacity;
   }
 
@@ -165,4 +189,4 @@ class KeyedCounter {
   }
 }
 
-module.exports = { TokenBucket, RateMeter, KeyedCounter };
+module.exports = { TokenBucket, RateMeter, KeyedCounter, MIN_BUCKET_MS };
